@@ -14,22 +14,32 @@ from jose import JWTError, jwt
 import uvicorn
 import os
 
+# --- NEW: Import the modern Google GenAI Client ---
+from google import genai 
+
 # --- 1. CONFIGURATION ---
 DATABASE_URL = "postgresql://postgres.fzmydgefyoaglnroenae:sB7FRUojV1IyiGxj@aws-1-eu-west-2.pooler.supabase.com:6543/postgres?sslmode=require"
 
-# ADMIN CONTACT DETAILS (Where notifications go)
+# ADMIN CONTACT DETAILS
 ADMIN_EMAIL = "jebetivy388@gmail.com" 
 
 # EMAIL SENDER CONFIGURATION
-# You will send emails FROM yourself TO yourself (standard for admin alerts)
 SENDER_EMAIL = "jebetivy388@gmail.com"
-# CRITICAL: You must replace this with your 16-character Google App Password
 SENDER_PASSWORD = "eupb xbce wbwa espe" 
 
 # SECURITY CONFIG
 SECRET_KEY = "DAGIV_SUPER_SECRET_KEY_CHANGE_THIS_IN_PROD"
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = 60 * 24 
+
+GEMINI_API_KEY = "AIzaSyBsDgJjYoXFQCLHRYkdeabEklIFMGvihoQ" 
+
+# Initialize the new Client
+try:
+    ai_client = genai.Client(api_key=GEMINI_API_KEY)
+except Exception as e:
+    print(f"⚠️ AI Client Init Error: {e}")
+    ai_client = None
 
 app = FastAPI()
 
@@ -44,6 +54,10 @@ app.add_middleware(
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="api/login")
 
 # --- 2. DATA MODELS ---
+
+class AIChatRequest(BaseModel):
+    prompt: str
+
 class InspectionRequest(BaseModel):
     machineType: str
     location: str
@@ -97,18 +111,12 @@ class LeaseRequestKP(BaseModel):
 # --- 3. NOTIFICATION SYSTEM (EMAIL ONLY) ---
 
 def send_email_alert(category: str, details: str):
-    """
-    Sends an HTML formatted email to the Admin.
-    Runs in the background to avoid delaying the response.
-    """
     if "REPLACE_THIS" in SENDER_PASSWORD:
-        print("⚠️ Email skipped: Google App Password not configured in server.py")
         return
 
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     subject = f"🔔 DAGIV ALERT: New {category}"
     
-    # Professional HTML Email Template
     html_content = f"""
     <html>
       <body style="font-family: Arial, sans-serif; color: #333;">
@@ -117,16 +125,9 @@ def send_email_alert(category: str, details: str):
             New {category} Received
           </h2>
           <p><strong>Time:</strong> {timestamp}</p>
-          
           <div style="background-color: #f9fafb; padding: 15px; border-radius: 5px; border-left: 4px solid #333;">
             <pre style="font-family: monospace; white-space: pre-wrap;">{details}</pre>
           </div>
-          
-          <br>
-          <p style="font-size: 12px; color: #666;">
-            This is an automated message from your DAGIV ERP System. 
-            <br>Login to the Desktop Admin Dashboard to take action.
-          </p>
         </div>
       </body>
     </html>
@@ -185,6 +186,37 @@ async def get_current_user(token: str = Depends(oauth2_scheme)):
 def read_root():
     return {"message": "DAGIV API (Secured) is Online"}
 
+# --- AI CONSULTANT ROUTE (FIXED MODEL NAME) ---
+@app.post("/api/ai-consultant")
+def ask_ai_engineer(req: AIChatRequest):
+    if not ai_client:
+        return {"status": "error", "response": "AI Client not initialized. Check API Key."}
+
+    try:
+        system_instruction = (
+            "You are a Senior Mechanical Engineer at DAGIV ENGINEERING in Kenya. "
+            "You provide technical, safety-conscious advice about heavy machinery. "
+            "Keep answers concise (under 100 words). "
+            "Be professional and authoritative."
+        )
+        
+        full_prompt = f"{system_instruction}\n\nUSER QUESTION: {req.prompt}"
+        
+        # FIX: Using specific model version 'gemini-1.5-flash-001'
+        response = ai_client.models.generate_content(
+            model="gemini-1.5-flash-001", 
+            contents=full_prompt
+        )
+        
+        return {"status": "success", "response": response.text}
+        
+    except Exception as e:
+        print(f"❌ Gemini AI Error: {str(e)}")
+        return {
+            "status": "error", 
+            "response": "Our AI Consultant is currently offline. Please contact our human engineers."
+        }
+
 @app.post("/api/login", response_model=Token)
 def login(login_data: LoginRequest):
     conn = get_db_connection()
@@ -232,7 +264,6 @@ def book_inspection(request: InspectionRequest, background_tasks: BackgroundTask
         conn.commit()
         conn.close()
         
-        # Trigger Email in Background
         details = f"Machine: {request.machineType}\nLocation: {request.location}\nClient: {request.contactPerson}\nPhone: {request.phone}\nRequested Date: {request.date}"
         background_tasks.add_task(send_email_alert, "Inspection Booking", details)
         
@@ -246,32 +277,23 @@ def submit_log(log: OperatorLog, background_tasks: BackgroundTasks, current_user
         conn = get_db_connection()
         cursor = conn.cursor()
         
-        # 1. Calculate Daily Duration from Time Strings
         try:
-            # Format expected: "HH:MM" (24h)
             t_start = datetime.strptime(log.startTime, "%H:%M")
             t_end = datetime.strptime(log.endTime, "%H:%M")
-            duration = (t_end - t_start).total_seconds() / 3600.0 # Convert seconds to hours
-            if duration < 0: duration += 24 # Handle overnight shifts (e.g. 10pm to 2am)
+            duration = (t_end - t_start).total_seconds() / 3600.0 
+            if duration < 0: duration += 24 
         except:
             duration = 0.0
 
-        # 2. Extract Unit from Notes (sent from frontend as [UNIT:km])
-        usage_unit = "km" # Default
+        usage_unit = "km" 
         clean_notes = log.notes
         if "[UNIT:" in log.notes:
             parts = log.notes.split("[UNIT:")
             clean_notes = parts[0].strip()
             usage_unit = parts[1].replace("]", "").strip()
 
-        # 3. Format Remarks
         full_remarks = f"FUEL: {log.fuelAddedLiters}L | OP: {log.operatorName} | {clean_notes}"
         
-        # 4. Save to DB
-        # We store:
-        # - mileage = The Cumulative Reading (from log.startOdometer in payload)
-        # - hours = The Daily Duration (calculated above)
-        # - usage_unit = The selected unit (km, mi, hrs)
         cursor.execute("""
             INSERT INTO service_logs 
             (vehicle, service_type, service_date, hours, mileage, remarks, usage_unit) 
@@ -281,7 +303,6 @@ def submit_log(log: OperatorLog, background_tasks: BackgroundTasks, current_user
         conn.commit()
         conn.close()
         
-        # Notification Logic... (Keep existing)
         if clean_notes or log.fuelAddedLiters > 0:
             details = f"Vehicle: {log.machineId}\nOperator: {log.operatorName}\nWork Duration: {round(duration, 2)} hrs\nCurrent Reading: {log.startOdometer} {usage_unit}\nNotes: {clean_notes}"
             background_tasks.add_task(send_email_alert, "Daily Log Alert", details)
