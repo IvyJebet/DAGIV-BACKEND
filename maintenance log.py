@@ -2,6 +2,7 @@ import psycopg2
 import time
 import sys
 import csv
+import re
 import tkinter as tk
 from tkinter import ttk, messagebox, simpledialog, filedialog
 from datetime import datetime, timedelta
@@ -15,7 +16,7 @@ import threading
 # Using Connection Pooler (Port 6543)
 DATABASE_URL = "postgresql://postgres.fzmydgefyoaglnroenae:sB7FRUojV1IyiGxj@aws-1-eu-west-2.pooler.supabase.com:6543/postgres?sslmode=require"
 
-# --- 1. SMART IMPORTS (KEPT EXACTLY AS IS) ---
+# --- 1. SMART IMPORTS ---
 try:
     from tkcalendar import DateEntry, Calendar
     HAS_CALENDAR = True
@@ -54,21 +55,28 @@ try:
 except ImportError:
     HAS_PANDAS = False
 
-# --- 2. CONSTANTS & CONFIG (KEPT EXACTLY AS IS) ---
-CURRENCY_LIST = [
-    "KES - Kenyan Shilling", "USD - US Dollar", "EUR - Euro", "GBP - British Pound", 
-    "AED - UAE Dirham", "AUD - Australian Dollar", "CAD - Canadian Dollar", 
-    "CNY - Chinese Yuan", "JPY - Japanese Yen", "INR - Indian Rupee", 
-    "TZS - Tanzanian Shilling", "UGX - Ugandan Shilling", "RWF - Rwandan Franc",
-    "ZAR - South African Rand", "NGN - Nigerian Naira", "GHS - Ghanaian Cedi",
-    "ETB - Ethiopian Birr", "SAR - Saudi Riyal", "QAR - Qatari Riyal",
-    "CHF - Swiss Franc", "SEK - Swedish Krona", "NOK - Norwegian Krone",
-    "DKK - Danish Krone", "SGD - Singapore Dollar", "HKD - Hong Kong Dollar",
-    "NZD - New Zealand Dollar", "THB - Thai Baht", "MYR - Malaysian Ringgit",
-    "IDR - Indonesian Rupiah", "PHP - Philippine Peso", "KRW - South Korean Won",
-    "BRL - Brazilian Real", "RUB - Russian Ruble", "TRY - Turkish Lira",
-    "MXN - Mexican Peso", "PLN - Polish Zloty", "EGP - Egyptian Pound"
-]
+try:
+    from pypdf import PdfReader
+    HAS_PDF = True
+except ImportError:
+    HAS_PDF = False
+
+# --- 2. CONSTANTS & CONFIG (ALPHABETICAL ORDER) ---
+CURRENCY_LIST = sorted([
+    "AED - UAE Dirham", "AUD - Australian Dollar", "BRL - Brazilian Real", 
+    "CAD - Canadian Dollar", "CHF - Swiss Franc", "CNY - Chinese Yuan", 
+    "DKK - Danish Krone", "EGP - Egyptian Pound", "ETB - Ethiopian Birr", 
+    "EUR - Euro", "GBP - British Pound", "GHS - Ghanaian Cedi", 
+    "HKD - Hong Kong Dollar", "IDR - Indonesian Rupiah", "INR - Indian Rupee", 
+    "JPY - Japanese Yen", "KES - Kenyan Shilling", "KRW - South Korean Won", 
+    "MXN - Mexican Peso", "MYR - Malaysian Ringgit", "NGN - Nigerian Naira", 
+    "NOK - Norwegian Krone", "NZD - New Zealand Dollar", "PHP - Philippine Peso", 
+    "PLN - Polish Zloty", "QAR - Qatari Riyal", "RUB - Russian Ruble", 
+    "RWF - Rwandan Franc", "SAR - Saudi Riyal", "SEK - Swedish Krona", 
+    "SGD - Singapore Dollar", "THB - Thai Baht", "TRY - Turkish Lira", 
+    "TZS - Tanzanian Shilling", "UGX - Ugandan Shilling", "USD - US Dollar", 
+    "ZAR - South African Rand"
+])
 
 USAGE_UNITS = ["Kilometers (km)", "Miles (mi)", "Hours (hrs)"]
 
@@ -102,7 +110,7 @@ SERVICE_CATEGORIES = {
 
 MACHINERY_TYPES = ["Tipper Truck", "Excavator (Cat)", "Backhoe Loader", "Grader", "Roller / Compactor", "Bulldozer", "Crane Truck", "Water Bowser"]
 
-# --- 4. HELPERS (KEPT EXACTLY AS IS) ---
+# --- 4. HELPERS ---
 
 def hash_text(s: str) -> str:
     return hashlib.sha256((s or "").encode()).hexdigest()
@@ -121,37 +129,23 @@ def send_bill_sms_threaded(phone, message, callback=None):
     threading.Thread(target=task, daemon=True).start()
 
 def calculate_daily_usage(vehicle_reg):
-    # Updated to use Postgres Connection
     try:
         conn = connect_db()
         if not conn: return 50.0
         cur = conn.cursor()
-        # SQL: %s instead of ?
         cur.execute("SELECT service_date, mileage FROM service_logs WHERE vehicle=%s ORDER BY service_date DESC LIMIT 3", (vehicle_reg,))
         rows = cur.fetchall()
         conn.close()
 
         if len(rows) < 2: return 50.0 
 
-        total_days = 0
-        total_val = 0
-        
-        for i in range(len(rows) - 1):
-            try:
-                d1 = datetime.strptime(rows[i][0], "%Y-%m-%d")
-                m1 = float(rows[i][1])
-                d2 = datetime.strptime(rows[i+1][0], "%Y-%m-%d")
-                m2 = float(rows[i+1][1])
-                days = (d1 - d2).days
-                val = m1 - m2
-                if days > 0 and val > 0:
-                    total_days += days; total_val += val
-            except: continue
-        if total_days == 0: return 50.0
-        return max(total_val / total_days, 5.0)
+        d1 = datetime.strptime(rows[0][0], "%Y-%m-%d"); m1 = float(rows[0][1])
+        d2 = datetime.strptime(rows[-1][0], "%Y-%m-%d"); m2 = float(rows[-1][1])
+        days = (d1 - d2).days; val = m1 - m2
+        return max(val / days, 5.0) if days > 0 else 50.0
     except: return 50.0
 
-# --- 5. DATABASE UTILS (UPDATED FOR SUPABASE) ---
+# --- 5. DATABASE UTILS ---
 
 def connect_db():
     try:
@@ -168,7 +162,6 @@ def initialize_db():
         
     cursor = conn.cursor()
 
-    # Tables updated for Postgres (SERIAL instead of AUTOINCREMENT)
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS service_logs (
             id SERIAL PRIMARY KEY,
@@ -252,13 +245,40 @@ def initialize_db():
         )
     """)
     
+    # Tables for Web Sync (Phase 1 Integration)
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS consultation_requests (
+            id SERIAL PRIMARY KEY,
+            name TEXT,
+            phone TEXT,
+            type TEXT,
+            details TEXT,
+            status TEXT DEFAULT 'Pending',
+            date_logged TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS service_inquiries (
+            id SERIAL PRIMARY KEY,
+            client_name TEXT,
+            phone TEXT,
+            email TEXT,
+            request_type TEXT,
+            details TEXT,
+            company TEXT,
+            category TEXT DEFAULT 'Service', 
+            status TEXT DEFAULT 'Pending',
+            date_logged TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+    
     # Default Admin
     cursor.execute("SELECT COUNT(*) FROM users")
     if cursor.fetchone()[0] == 0:
         cursor.execute("""
             INSERT INTO users (username, password, role, email, phone, security_question, security_answer_hash) 
             VALUES (%s, %s, %s, %s, %s, %s, %s)
-        """, ("admin", hash_text("admin"), "admin", "admin@empire.co.ke", "0700000000", "Default Question", hash_text("admin")))
+        """, ("admin", hash_text("admin"), "admin", "admin@dagiv.co.ke", "0700000000", "Default Question", hash_text("admin")))
     
     conn.commit()
     conn.close()
@@ -282,7 +302,6 @@ def run_main_app(username, role):
     tab_planner = ttk.Frame(notebook)
     notebook.add(tab_planner, text="📅 Smart Alerts")
 
-    # --- NEW: WEB REQUESTS TAB ---
     tab_requests = ttk.Frame(notebook)
     notebook.add(tab_requests, text="🌍 Web Requests")
 
@@ -299,54 +318,137 @@ def run_main_app(username, role):
     notebook.add(tab_account, text="👤 Account & Users")
 
     # ==========================================
-    # TAB: WEB REQUESTS LOGIC (THREADED)
+    # TAB: WEB REQUESTS LOGIC (PROFESSIONAL SUITES)
     # ==========================================
-    req_cols = ("ID", "Type", "Contact", "Phone", "Date", "Status")
-    req_tree = ttk.Treeview(tab_requests, columns=req_cols, show="headings")
-    for c in req_cols: 
-        req_tree.heading(c, text=c)
-        req_tree.column(c, width=100)
-    req_tree.pack(fill="both", expand=True, padx=10, pady=10)
+    
+    web_notebook = ttk.Notebook(tab_requests)
+    web_notebook.pack(fill="both", expand=True, padx=5, pady=5)
+    
+    tab_web_insp = ttk.Frame(web_notebook)
+    tab_web_serv = ttk.Frame(web_notebook)
+    tab_web_cons = ttk.Frame(web_notebook)
+    tab_web_logs = ttk.Frame(web_notebook)
+    
+    web_notebook.add(tab_web_insp, text="🔍 Inspection Bookings")
+    web_notebook.add(tab_web_serv, text="Vm  Services & Leasing")
+    web_notebook.add(tab_web_cons, text="Oc  Engineer Consults")
+    web_notebook.add(tab_web_logs, text="📋 Incoming Field Logs")
 
-    def mark_request_done():
-        sel = req_tree.selection()
-        if not sel: return
-        item_id = req_tree.item(sel[0])['values'][0]
-        try:
-            conn = connect_db(); c = conn.cursor()
-            c.execute("UPDATE inspection_requests SET status='Completed' WHERE id=%s", (item_id,))
-            conn.commit(); conn.close()
-            # Force immediate refresh
-            threading.Thread(target=fetch_web_data, daemon=True).start()
-        except Exception as e:
-            messagebox.showerror("Error", str(e))
+    # --- 1. INSPECTIONS VIEW ---
+    insp_cols = ("ID", "Machine", "Client", "Phone", "Date", "Status")
+    insp_tree = ttk.Treeview(tab_web_insp, columns=insp_cols, show="headings", height=15)
+    for c in insp_cols: insp_tree.heading(c, text=c); insp_tree.column(c, width=100)
+    insp_tree.pack(fill="both", expand=True, padx=5, pady=5)
+    
+    def mark_insp_done():
+        sel = insp_tree.selection()
+        if sel:
+            iid = insp_tree.item(sel[0])['values'][0]
+            c = connect_db(); cur = c.cursor()
+            cur.execute("UPDATE inspection_requests SET status='Contacted' WHERE id=%s", (iid,))
+            c.commit(); c.close(); refresh_web_all()
+    tk.Button(tab_web_insp, text="✅ Mark Inspection as Handled", command=mark_insp_done).pack(pady=5)
 
-    req_btn_frame = ttk.Frame(tab_requests)
-    req_btn_frame.pack(fill="x", padx=10, pady=5)
-    tk.Button(req_btn_frame, text="✅ Mark as Contacted/Done", bg="green", fg="white", command=mark_request_done).pack(side="left")
+    # --- 2. SERVICES & LEASING VIEW ---
+    serv_cols = ("ID", "Type", "Category", "Client", "Phone", "Details", "Status")
+    serv_tree = ttk.Treeview(tab_web_serv, columns=serv_cols, show="headings", height=15)
+    for c in serv_cols: serv_tree.heading(c, text=c); serv_tree.column(c, width=90)
+    serv_tree.column("Details", width=250)
+    serv_tree.pack(fill="both", expand=True, padx=5, pady=5)
 
-    def fetch_web_data():
-        """Runs in background thread to prevent buffering"""
-        try:
-            conn = connect_db()
-            if not conn: return
-            cur = conn.cursor()
-            cur.execute("SELECT id, machine_type, contact_person, phone, date, status FROM inspection_requests WHERE status='Pending'")
-            rows = cur.fetchall()
-            conn.close()
-            app.after(0, update_web_ui, rows)
-        except: pass
-        
-    def update_web_ui(rows):
-        for i in req_tree.get_children(): req_tree.delete(i)
-        for row in rows: req_tree.insert("", "end", values=row)
-        app.after(5000, lambda: threading.Thread(target=fetch_web_data, daemon=True).start())
+    def mark_serv_done():
+        sel = serv_tree.selection()
+        if sel:
+            iid = serv_tree.item(sel[0])['values'][0]
+            c = connect_db(); cur = c.cursor()
+            cur.execute("UPDATE service_inquiries SET status='Contacted' WHERE id=%s", (iid,))
+            c.commit(); c.close(); refresh_web_all()
+    tk.Button(tab_web_serv, text="✅ Mark Inquiry as Handled", command=mark_serv_done).pack(pady=5)
 
-    # Start loop
-    threading.Thread(target=fetch_web_data, daemon=True).start()
+    # --- 3. CONSULTATIONS VIEW ---
+    cons_cols = ("ID", "Client", "Type", "Details", "Status")
+    cons_tree = ttk.Treeview(tab_web_cons, columns=cons_cols, show="headings", height=15)
+    for c in cons_cols: cons_tree.heading(c, text=c)
+    cons_tree.column("Details", width=300)
+    cons_tree.pack(fill="both", expand=True, padx=5, pady=5)
+
+    def mark_cons_done():
+        sel = cons_tree.selection()
+        if sel:
+            iid = cons_tree.item(sel[0])['values'][0]
+            c = connect_db(); cur = c.cursor()
+            cur.execute("UPDATE consultation_requests SET status='Contacted' WHERE id=%s", (iid,))
+            c.commit(); c.close(); refresh_web_all()
+    tk.Button(tab_web_cons, text="✅ Mark Consultation as Done", command=mark_cons_done).pack(pady=5)
+
+    # --- 4. OPERATOR LOGS FEED (Read-Only Monitor) ---
+    op_cols = ("Date", "Vehicle", "Operator", "Hrs", "Fuel", "Remarks")
+    op_tree = ttk.Treeview(tab_web_logs, columns=op_cols, show="headings", height=15)
+    for c in op_cols: op_tree.heading(c, text=c)
+    op_tree.pack(fill="both", expand=True, padx=5, pady=5)
+
+    # --- UNIFIED DATA FETCHING LOOP ---
+    def refresh_web_all():
+        def task():
+            try:
+                conn = connect_db()
+                if not conn: return
+                cur = conn.cursor()
+
+                # 1. Fetch Inspections
+                cur.execute("SELECT id, machine_type, contact_person, phone, date, status FROM inspection_requests WHERE status='Pending'")
+                insp_rows = cur.fetchall()
+
+                # 2. Fetch Services/Leases
+                try:
+                    cur.execute("SELECT id, request_type, category, client_name, phone, details, status FROM service_inquiries WHERE status='Pending'")
+                    serv_rows = cur.fetchall()
+                except: serv_rows = []
+
+                # 3. Fetch Consultations
+                try:
+                    cur.execute("SELECT id, name, type, details, status FROM consultation_requests WHERE status='Pending'")
+                    cons_rows = cur.fetchall()
+                except: cons_rows = []
+
+                # 4. Fetch Recent Logs (Last 20) with Parsing
+                cur.execute("SELECT service_date, vehicle, hours, mileage, remarks FROM service_logs WHERE service_type='Operator Daily Log' ORDER BY id DESC LIMIT 20")
+                raw_logs = cur.fetchall()
+                
+                log_rows_formatted = []
+                for row in raw_logs:
+                    r_date, r_veh, r_hrs, r_odo, r_rem = row
+                    op_name = "Unknown"
+                    fuel_val = "0L"
+                    clean_rem = r_rem
+                    if r_rem:
+                        parts = r_rem.split('|')
+                        for p in parts:
+                            p = p.strip()
+                            if p.startswith("OP:"): op_name = p.replace("OP:", "").strip()
+                            elif p.startswith("FUEL:"): fuel_val = p.replace("FUEL:", "").strip()
+                        clean_rem = r_rem.split('|')[-1].strip()
+                    log_rows_formatted.append((r_date, r_veh, op_name, f"{r_hrs} hrs", fuel_val, clean_rem))
+
+                conn.close()
+                app.after(0, lambda: _update_trees(insp_rows, serv_rows, cons_rows, log_rows_formatted))
+            except Exception as e: print(e)
+
+        threading.Thread(target=task, daemon=True).start()
+        app.after(5000, refresh_web_all)
+
+    def _update_trees(insp, serv, cons, logs):
+        for t in [insp_tree, serv_tree, cons_tree, op_tree]:
+            for i in t.get_children(): t.delete(i)
+        for r in insp: insp_tree.insert("", "end", values=r)
+        for r in serv: serv_tree.insert("", "end", values=r)
+        for r in cons: cons_tree.insert("", "end", values=r)
+        for r in logs: op_tree.insert("", "end", values=r)
+
+    refresh_web_all()
 
     # ==========================================
-    # TAB 0: SMART PLANNER (INTERACTIVE)
+    # TAB 0: SMART PLANNER (INTERACTIVE & PREDICTIVE)
     # ==========================================
     planner_frame = ttk.Frame(tab_planner)
     planner_frame.pack(fill="both", expand=True, padx=10, pady=10)
@@ -457,38 +559,72 @@ def run_main_app(username, role):
             today = datetime.now().date()
             f_mode = view_filter_var.get()
 
+            # --- MECHANICAL PREDICTION ENGINE ---
             if f_mode in ["All", "Mechanical"]:
-                # Fetch all logs (Simplified for Postgres Migration)
-                cur.execute("SELECT vehicle, next_service, mileage, usage_unit FROM service_logs")
-                all_rows = cur.fetchall()
-                # Sort in python to get latest per vehicle
-                latest_logs = {} 
-                for r in all_rows: 
-                    # Assuming higher ID is later, or we process all. 
-                    # For stability: just process every unique vehicle found
-                    latest_logs[r[0]] = r 
-                
-                # Better: Query Distinct Vehicles
                 cur.execute("SELECT DISTINCT vehicle FROM service_logs")
                 vehs = cur.fetchall()
+                
                 for v_tuple in vehs:
                     veh = v_tuple[0]
-                    cur.execute("SELECT next_service, mileage, usage_unit FROM service_logs WHERE vehicle=%s ORDER BY id DESC LIMIT 1", (veh,))
-                    last = cur.fetchone()
-                    if last:
-                        next_v, curr_v, unit = last
-                        daily = calculate_daily_usage(veh)
-                        if not next_v: next_v = (curr_v or 0) + 5000
-                        rem = next_v - (curr_v or 0)
-                        try: days = int(rem/daily)
-                        except: days = 30
-                        pred_date = today + timedelta(days=days)
-                        urg, msg = "GREEN", "Healthy"
-                        unit_s = unit if unit else "km"
-                        if rem < 500: urg, msg = "RED", f"Service Due ({int(rem)}{unit_s})"
-                        elif rem < 2000: urg, msg = "YELLOW", f"Upcoming ({int(rem)}{unit_s})"
-                        results.append({"v": veh, "c": "🔧 Mech", "u": urg, "a": msg, "d": pred_date})
+                    cur.execute("SELECT service_date, mileage, usage_unit, next_service FROM service_logs WHERE vehicle=%s ORDER BY service_date DESC LIMIT 5", (veh,))
+                    logs = cur.fetchall()
+                    
+                    if logs:
+                        # Latest Data
+                        last_date_str, current_reading, unit, set_next_service = logs[0]
+                        unit = unit if unit else "km"
+                        current_reading = float(current_reading or 0)
+                        
+                        # 1. Determine Service Interval
+                        interval = 5000 # Default km
+                        if unit == 'mi': interval = 3000
+                        elif unit == 'hrs': interval = 500
+                        
+                        # 2. Determine Next Target
+                        if set_next_service and float(set_next_service) > current_reading:
+                            target_reading = float(set_next_service)
+                        else:
+                            target_reading = (int(current_reading / interval) + 1) * interval
 
+                        remaining = target_reading - current_reading
+                        
+                        # 3. Calculate Daily Usage Rate (Fluid Math)
+                        daily_rate = 0
+                        if len(logs) > 1:
+                            old_date_str, old_reading, _, _ = logs[-1]
+                            try:
+                                d1 = datetime.strptime(last_date_str, "%Y-%m-%d").date()
+                                d2 = datetime.strptime(old_date_str, "%Y-%m-%d").date()
+                                days_diff = (d1 - d2).days
+                                usage_diff = current_reading - float(old_reading or 0)
+                                if days_diff > 0 and usage_diff > 0:
+                                    daily_rate = usage_diff / days_diff
+                            except: pass
+                        
+                        if daily_rate <= 0:
+                            if unit == 'hrs': daily_rate = 8.0 
+                            else: daily_rate = 50.0 
+                            
+                        # 4. Predict Date
+                        try:
+                            days_to_service = int(remaining / daily_rate)
+                        except: days_to_service = 30
+                        predicted_date = today + timedelta(days=days_to_service)
+                        
+                        # 5. Status Logic
+                        status = "GREEN"
+                        msg = f"Healthy ({int(remaining)} {unit} left)"
+                        
+                        if remaining < (interval * 0.1) or days_to_service < 7:
+                            status = "RED"
+                            msg = f"SERVICE DUE! ({int(remaining)} {unit})"
+                        elif remaining < (interval * 0.25) or days_to_service < 21:
+                            status = "YELLOW"
+                            msg = f"Upcoming in {days_to_service} days"
+
+                        results.append({"v": veh, "c": f"🔧 {unit.upper()}", "u": status, "a": msg, "d": predicted_date})
+
+            # --- COMPLIANCE ALERTS ---
             if f_mode in ["All", "Compliance"]:
                 cur.execute("SELECT vehicle, insurance_expiry, inspection_expiry, speed_governor_expiry FROM expiry_alerts")
                 for row in cur.fetchall():
@@ -519,7 +655,7 @@ def run_main_app(username, role):
     app.after(1000, refresh_smart_planner)
 
     # ==========================================
-    # TAB 1: SERVICE LOGS
+    # TAB 1: SERVICE LOGS + SMART UPLOAD
     # ==========================================
     input_frame = ttk.LabelFrame(tab_service, text="Log New Service / Edit", padding=10)
     input_frame.pack(side="left", fill="y", padx=10, pady=10)
@@ -546,7 +682,6 @@ def run_main_app(username, role):
     ttk.Label(input_frame, text="Date:").grid(row=3, column=0, sticky="w", pady=5)
     date_ent = DateEntry(input_frame, width=28, date_pattern="yyyy-mm-dd"); date_ent.grid(row=3, column=1, pady=5)
 
-    # --- UPDATED COST & CURRENCY ---
     ttk.Label(input_frame, text="Cost:").grid(row=4, column=0, sticky="w", pady=5)
     cost_frame = ttk.Frame(input_frame)
     cost_frame.grid(row=4, column=1, pady=5, sticky="w")
@@ -555,7 +690,6 @@ def run_main_app(username, role):
     currency_combo.set("KES - Kenyan Shilling")
     currency_combo.pack(side="left", padx=5)
 
-    # --- UPDATED USAGE UNITS ---
     ttk.Label(input_frame, text="Current Usage:").grid(row=5, column=0, sticky="w", pady=5)
     usage_frame = ttk.Frame(input_frame)
     usage_frame.grid(row=5, column=1, pady=5, sticky="w")
@@ -573,16 +707,87 @@ def run_main_app(username, role):
     ttk.Label(input_frame, text="Remarks:").grid(row=7, column=0, sticky="w", pady=5)
     remarks_ent = ttk.Entry(input_frame, width=30); remarks_ent.grid(row=7, column=1, pady=5)
 
-    # Expiry
+    # --- COMPLIANCE SECTION WITH SMART UPLOAD ---
     ttk.Separator(input_frame, orient="horizontal").grid(row=8, column=0, columnspan=2, sticky="ew", pady=10)
-    ttk.Label(input_frame, text="Update Compliance Dates", font=("Arial", 9, "bold")).grid(row=9, column=0, columnspan=2)
+    ttk.Label(input_frame, text="Compliance & Smart Upload", font=("Arial", 9, "bold")).grid(row=9, column=0, columnspan=2)
+    
     ins_var = tk.BooleanVar(); insp_var = tk.BooleanVar(); spd_var = tk.BooleanVar()
     ttk.Checkbutton(input_frame, text="Insurance Expiry", variable=ins_var).grid(row=10, column=0, sticky="w")
     ins_date = DateEntry(input_frame, width=15, date_pattern="yyyy-mm-dd"); ins_date.grid(row=10, column=1, sticky="w")
+    
     ttk.Checkbutton(input_frame, text="Inspection Expiry", variable=insp_var).grid(row=11, column=0, sticky="w")
     insp_date = DateEntry(input_frame, width=15, date_pattern="yyyy-mm-dd"); insp_date.grid(row=11, column=1, sticky="w")
-    ttk.Checkbutton(input_frame, text="Speed Governor Expiry", variable=spd_var).grid(row=12, column=0, sticky="w")
+    
+    ttk.Checkbutton(input_frame, text="Speed Gov Expiry", variable=spd_var).grid(row=12, column=0, sticky="w")
     spd_date = DateEntry(input_frame, width=15, date_pattern="yyyy-mm-dd"); spd_date.grid(row=12, column=1, sticky="w")
+
+    # SMART SCAN LOGIC
+    def smart_scan_certificate():
+        if not HAS_PDF:
+            messagebox.showerror("Missing Library", "Please install pypdf to use this feature:\npip install pypdf")
+            return
+        
+        filepath = filedialog.askopenfilename(filetypes=[("PDF Documents", "*.pdf")])
+        if not filepath: return
+
+        try:
+            reader = PdfReader(filepath)
+            text = ""
+            for page in reader.pages:
+                text += page.extract_text() + "\n"
+            
+            # 1. Find Vehicle Reg (Kenya format: KCD 123A or KCD 123)
+            # Regex: \bK[A-Z]{2}\s?\d{3}[A-Z]?\b looks for pattern like KCD 892J
+            reg_match = re.search(r'\bK[A-Z]{2}\s?\d{3}[A-Z]?\b', text)
+            if reg_match:
+                found_reg = reg_match.group(0).replace(" ", "")
+                vehicle_ent.delete(0, tk.END)
+                vehicle_ent.insert(0, found_reg)
+                messagebox.showinfo("Smart Scan", f"Detected Vehicle: {found_reg}")
+            else:
+                messagebox.showwarning("Smart Scan", "Could not detect Vehicle Registration Number.")
+
+            # 2. Find Date (dd/mm/yyyy or dd-mm-yyyy or dd.mm.yyyy)
+            text_lower = text.lower()
+            date_matches = re.findall(r'\d{2}[/.-]\d{2}[/.-]\d{4}', text)
+            
+            # Simple heuristic: The latest date in the future is likely the expiry
+            future_dates = []
+            today = datetime.now()
+            for d_str in date_matches:
+                try:
+                    d_clean = d_str.replace('.', '/').replace('-', '/')
+                    d_obj = datetime.strptime(d_clean, "%d/%m/%Y")
+                    if d_obj > today: future_dates.append(d_obj)
+                except: pass
+            
+            if future_dates:
+                best_date = max(future_dates) # Furthest date is usually expiry
+                
+                # 3. Guess Type
+                if any(x in text_lower for x in ['insurance', 'policy', 'britam', 'jubilee', 'apa', 'cic']):
+                    ins_var.set(True)
+                    ins_date.set_date(best_date)
+                    messagebox.showinfo("Success", f"Identified INSURANCE Certificate.\nExpiry: {best_date.strftime('%Y-%m-%d')}")
+                elif any(x in text_lower for x in ['inspection', 'ntsa', 'sticker']):
+                    insp_var.set(True)
+                    insp_date.set_date(best_date)
+                    messagebox.showinfo("Success", f"Identified INSPECTION Certificate.\nExpiry: {best_date.strftime('%Y-%m-%d')}")
+                elif any(x in text_lower for x in ['speed', 'governor', 'limiter', 'omata']):
+                    spd_var.set(True)
+                    spd_date.set_date(best_date)
+                    messagebox.showinfo("Success", f"Identified SPEED GOVERNOR Certificate.\nExpiry: {best_date.strftime('%Y-%m-%d')}")
+                else:
+                    messagebox.showinfo("Ambiguous", f"Found date {best_date.strftime('%Y-%m-%d')} but couldn't determine type.\nPlease check the box manually.")
+            else:
+                messagebox.showwarning("Scan", "No valid future dates found in document.")
+
+        except Exception as e:
+            messagebox.showerror("Parse Error", f"Failed to read file: {str(e)}")
+
+    # Upload Button
+    btn_scan = tk.Button(input_frame, text="📂 Upload Certificate (Auto-Fill)", bg="#6f42c1", fg="white", font=("Arial", 9, "bold"), command=smart_scan_certificate)
+    btn_scan.grid(row=13, column=0, columnspan=2, sticky="ew", pady=10)
 
     tree_frame = ttk.Frame(tab_service)
     tree_frame.pack(side="right", fill="both", expand=True, padx=10, pady=10)
@@ -620,31 +825,36 @@ def run_main_app(username, role):
         def update_ui(rows):
             for i in tree.get_children(): tree.delete(i)
             for row in rows: tree.insert("", "end", values=row)
-            app.after(10000, lambda: threading.Thread(target=fetch, daemon=True).start()) # Auto refresh logs every 10s
+            app.after(10000, lambda: threading.Thread(target=fetch, daemon=True).start())
 
         threading.Thread(target=fetch, daemon=True).start()
 
-    # Start log refresh
     refresh_tree()
 
     def save_entry():
         veh = vehicle_ent.get(); svc = item_combo.get()
-        if not veh or not svc: messagebox.showerror("Error", "Vehicle and Service required"); return
+        # Allow saving compliance even if service is empty, but warn if vehicle missing
+        if not veh: messagebox.showerror("Error", "Vehicle Reg required"); return
         
         conn = connect_db(); cur = conn.cursor()
         curr = currency_combo.get().split(" ")[0]; unit = unit_combo.get()
         today_str = datetime.now().strftime("%Y-%m-%d")
         
         try:
-            if edit_id_var.get():
-                cur.execute("UPDATE service_logs SET vehicle=%s, service_type=%s, service_date=%s, cost=%s, currency=%s, mileage=%s, usage_unit=%s, next_service=%s, remarks=%s WHERE id=%s",
-                           (veh, svc, date_ent.get(), cost_ent.get(), curr, mileage_ent.get(), unit, next_ent.get(), remarks_ent.get(), edit_id_var.get()))
-                msg = "Updated"
+            # 1. Save Service Log if Service Item is selected
+            if svc:
+                if edit_id_var.get():
+                    cur.execute("UPDATE service_logs SET vehicle=%s, service_type=%s, service_date=%s, cost=%s, currency=%s, mileage=%s, usage_unit=%s, next_service=%s, remarks=%s WHERE id=%s",
+                               (veh, svc, date_ent.get(), cost_ent.get(), curr, mileage_ent.get(), unit, next_ent.get(), remarks_ent.get(), edit_id_var.get()))
+                    msg = "Updated"
+                else:
+                    cur.execute("INSERT INTO service_logs (vehicle, service_type, service_date, cost, currency, mileage, usage_unit, next_service, remarks) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)",
+                               (veh, svc, date_ent.get(), cost_ent.get(), curr, mileage_ent.get(), unit, next_ent.get(), remarks_ent.get()))
+                    msg = "Saved"
             else:
-                cur.execute("INSERT INTO service_logs (vehicle, service_type, service_date, cost, currency, mileage, usage_unit, next_service, remarks) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)",
-                           (veh, svc, date_ent.get(), cost_ent.get(), curr, mileage_ent.get(), unit, next_ent.get(), remarks_ent.get()))
-                msg = "Saved"
-            
+                msg = "Compliance Updated"
+
+            # 2. Save Compliance
             if ins_var.get() or insp_var.get() or spd_var.get():
                 cur.execute("INSERT INTO expiry_alerts (vehicle) VALUES (%s) ON CONFLICT (vehicle) DO NOTHING", (veh,))
                 if ins_var.get(): cur.execute("UPDATE expiry_alerts SET insurance_expiry=%s, last_alert_date=%s WHERE vehicle=%s", (ins_date.get(), today_str, veh))
@@ -654,7 +864,6 @@ def run_main_app(username, role):
             conn.commit()
             messagebox.showinfo("Success", msg)
             clear_form()
-            # Force immediate fetch
             threading.Thread(target=refresh_smart_planner, daemon=True).start()
         except Exception as e: messagebox.showerror("Database Error", str(e))
         finally: conn.close()
@@ -718,12 +927,12 @@ def run_main_app(username, role):
             else: messagebox.showwarning("Used", "Part already installed!")
         else: messagebox.showerror("Counterfeit", "❌ Serial not found!")
 
-    btn_frame = ttk.Frame(input_frame); btn_frame.grid(row=13, column=0, columnspan=2, pady=15)
+    btn_frame = ttk.Frame(input_frame); btn_frame.grid(row=14, column=0, columnspan=2, pady=15)
     btn_save = tk.Button(btn_frame, text="Save Entry", bg="#28a745", fg="white", command=save_entry, width=15); btn_save.pack(side="left", padx=2)
     tk.Button(btn_frame, text="Edit Entry", bg="#ffc107", command=load_for_edit, width=8).pack(side="left", padx=2)
     tk.Button(btn_frame, text="Delete ", bg="#dc3545", fg="white", command=delete_entry, width=8).pack(side="left", padx=2)
     tk.Button(btn_frame, text="📊 Export", bg="#17a2b8", fg="white", command=export_to_excel, width=12).pack(side="left", padx=2)
-    tk.Button(input_frame, text="🛡️ Verify Genuine Part", bg="#007bff", fg="white", command=verify_part_real).grid(row=14, column=0, columnspan=2, sticky="ew", pady=5)
+    tk.Button(input_frame, text="🛡️ Verify Genuine Part", bg="#007bff", fg="white", command=verify_part_real).grid(row=15, column=0, columnspan=2, sticky="ew", pady=5)
 
     # ==========================================
     # TAB 2: LOGISTICS & LEASING
