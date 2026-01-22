@@ -272,6 +272,20 @@ def initialize_db():
         )
     """)
     
+    # --- NEW: SELLERS TABLE (If missing) ---
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS sellers (
+            id SERIAL PRIMARY KEY,
+            name TEXT,
+            phone TEXT UNIQUE,
+            location TEXT,
+            email TEXT,
+            status TEXT DEFAULT 'PENDING',
+            rating REAL DEFAULT 0.0,
+            joined_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+    
     # Default Admin
     cursor.execute("SELECT COUNT(*) FROM users")
     if cursor.fetchone()[0] == 0:
@@ -324,15 +338,34 @@ def run_main_app(username, role):
     web_notebook = ttk.Notebook(tab_requests)
     web_notebook.pack(fill="both", expand=True, padx=5, pady=5)
     
+    tab_web_sellers = ttk.Frame(web_notebook) # NEW
     tab_web_insp = ttk.Frame(web_notebook)
     tab_web_serv = ttk.Frame(web_notebook)
     tab_web_cons = ttk.Frame(web_notebook)
     tab_web_logs = ttk.Frame(web_notebook)
     
+    web_notebook.add(tab_web_sellers, text="🛡️ Seller Verifications") # NEW
     web_notebook.add(tab_web_insp, text="🔍 Inspection Bookings")
     web_notebook.add(tab_web_serv, text="Vm  Services & Leasing")
     web_notebook.add(tab_web_cons, text="Oc  Engineer Consults")
     web_notebook.add(tab_web_logs, text="📋 Incoming Field Logs")
+
+    # --- 0. SELLER VERIFICATIONS (NEW) ---
+    seller_cols = ("ID", "Name", "Phone", "Email", "Location", "Status")
+    seller_tree = ttk.Treeview(tab_web_sellers, columns=seller_cols, show="headings", height=15)
+    for c in seller_cols: seller_tree.heading(c, text=c); seller_tree.column(c, width=120)
+    seller_tree.pack(fill="both", expand=True, padx=5, pady=5)
+    
+    def approve_seller_action():
+        sel = seller_tree.selection()
+        if sel:
+            iid = seller_tree.item(sel[0])['values'][0]
+            if messagebox.askyesno("Confirm", "Mark this Seller as VERIFIED?\nThey will be able to post listings immediately."):
+                c = connect_db(); cur = c.cursor()
+                cur.execute("UPDATE sellers SET status='VERIFIED' WHERE id=%s", (iid,))
+                c.commit(); c.close(); refresh_web_all()
+    
+    tk.Button(tab_web_sellers, text="✅ Approve Seller Account", bg="#28a745", fg="white", command=approve_seller_action).pack(pady=5)
 
     # --- 1. INSPECTIONS VIEW ---
     insp_cols = ("ID", "Machine", "Client", "Phone", "Date", "Status")
@@ -410,8 +443,14 @@ def run_main_app(username, role):
                     cur.execute("SELECT id, name, type, details, status FROM consultation_requests WHERE status='Pending'")
                     cons_rows = cur.fetchall()
                 except: cons_rows = []
+                
+                # 4. Fetch Pending Sellers (NEW)
+                try:
+                    cur.execute("SELECT id, name, phone, email, location, status FROM sellers WHERE status='PENDING'")
+                    seller_rows = cur.fetchall()
+                except: seller_rows = []
 
-                # 4. Fetch Recent Logs (Last 20) with Parsing
+                # 5. Fetch Recent Logs (Last 20) with Parsing
                 cur.execute("SELECT service_date, vehicle, hours, mileage, remarks FROM service_logs WHERE service_type='Operator Daily Log' ORDER BY id DESC LIMIT 20")
                 raw_logs = cur.fetchall()
                 
@@ -431,19 +470,20 @@ def run_main_app(username, role):
                     log_rows_formatted.append((r_date, r_veh, op_name, f"{r_hrs} hrs", fuel_val, clean_rem))
 
                 conn.close()
-                app.after(0, lambda: _update_trees(insp_rows, serv_rows, cons_rows, log_rows_formatted))
+                app.after(0, lambda: _update_trees(insp_rows, serv_rows, cons_rows, log_rows_formatted, seller_rows))
             except Exception as e: print(e)
 
         threading.Thread(target=task, daemon=True).start()
         app.after(5000, refresh_web_all)
 
-    def _update_trees(insp, serv, cons, logs):
-        for t in [insp_tree, serv_tree, cons_tree, op_tree]:
+    def _update_trees(insp, serv, cons, logs, sellers):
+        for t in [insp_tree, serv_tree, cons_tree, op_tree, seller_tree]:
             for i in t.get_children(): t.delete(i)
         for r in insp: insp_tree.insert("", "end", values=r)
         for r in serv: serv_tree.insert("", "end", values=r)
         for r in cons: cons_tree.insert("", "end", values=r)
         for r in logs: op_tree.insert("", "end", values=r)
+        for r in sellers: seller_tree.insert("", "end", values=r)
 
     refresh_web_all()
 

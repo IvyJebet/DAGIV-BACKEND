@@ -13,28 +13,17 @@ from datetime import datetime, timedelta
 from jose import JWTError, jwt
 import uvicorn
 import os
-
-# --- NEW: Import the modern Google GenAI Client ---
 from google import genai 
 
-# --- 1. CONFIGURATION ---
 DATABASE_URL = "postgresql://postgres.fzmydgefyoaglnroenae:sB7FRUojV1IyiGxj@aws-1-eu-west-2.pooler.supabase.com:6543/postgres?sslmode=require"
-
-# ADMIN CONTACT DETAILS
 ADMIN_EMAIL = "jebetivy388@gmail.com" 
-
-# EMAIL SENDER CONFIGURATION
 SENDER_EMAIL = "jebetivy388@gmail.com"
 SENDER_PASSWORD = "eupb xbce wbwa espe" 
-
-# SECURITY CONFIG
 SECRET_KEY = "DAGIV_SUPER_SECRET_KEY_CHANGE_THIS_IN_PROD"
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = 60 * 24 
 
 GEMINI_API_KEY = "AIzaSyBsDgJjYoXFQCLHRYkdeabEklIFMGvihoQ" 
-
-# Initialize the new Client
 try:
     ai_client = genai.Client(api_key=GEMINI_API_KEY)
 except Exception as e:
@@ -107,6 +96,36 @@ class LeaseRequestKP(BaseModel):
     customerName: str
     phone: str
     duration: str
+
+class MarketListing(BaseModel):
+    listingType: str  # 'SALE', 'RENT', 'PART'
+    sellerName: str
+    phone: str
+    location: str
+    category: str
+    subCategory: str
+    brand: str
+    model: str
+    price: float
+    currency: str
+    specs: dict
+
+# --- NEW: SELLER VERIFICATION MODELS ---
+class SellerCheck(BaseModel):
+    phone: str
+
+# 1. UPDATE THE MODEL
+class SellerRegistration(BaseModel):
+    name: str
+    phone: str
+    location: str
+    email: str
+    businessType: str  # 'Company' or 'Individual'
+    regNumber: str     # KRA PIN or National ID
+    # New File Paths (In a real app, these would be S3 URLs, here we store filenames/base64)
+    doc_primary: str   # ID Front or Cert of Incorp
+    doc_secondary: str # ID Back or KRA PIN
+    doc_proof: str     # Selfie with Item or Business Permit
 
 # --- 3. NOTIFICATION SYSTEM (EMAIL ONLY) ---
 
@@ -407,6 +426,133 @@ def request_lease(req: LeaseRequestKP, background_tasks: BackgroundTasks):
 
         return {"status": "success", "message": "Lease inquiry sent"}
     except Exception as e:
+        return {"status": "error", "detail": str(e)}
+
+
+@app.post("/api/sellers/check")
+def check_seller_status(check: SellerCheck):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS sellers (
+            id SERIAL PRIMARY KEY,
+            name TEXT,
+            phone TEXT UNIQUE,
+            location TEXT,
+            email TEXT,
+            status TEXT DEFAULT 'PENDING',
+            rating REAL DEFAULT 0.0,
+            joined_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            business_type TEXT,
+            reg_number TEXT,
+            doc_primary TEXT,
+            doc_secondary TEXT,
+            doc_proof TEXT
+        )
+    """)
+    
+    try:
+        cursor.execute("ALTER TABLE sellers ADD COLUMN doc_primary TEXT")
+        cursor.execute("ALTER TABLE sellers ADD COLUMN doc_secondary TEXT")
+        cursor.execute("ALTER TABLE sellers ADD COLUMN doc_proof TEXT")
+    except:
+        conn.rollback()
+    else:
+        conn.commit()
+    cursor.execute("SELECT name, status, id FROM sellers WHERE phone = %s", (check.phone,))
+    result = cursor.fetchone()
+    conn.close()
+    
+    if result:
+        return {"exists": True, "name": result[0], "status": result[1], "sellerId": result[2]}
+    else:
+        return {"exists": False, "status": "UNKNOWN"}
+
+@app.post("/api/sellers/register")
+def register_seller(seller: SellerRegistration, background_tasks: BackgroundTasks):
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        
+        cursor.execute(
+            """INSERT INTO sellers 
+               (name, phone, location, email, business_type, reg_number, doc_primary, doc_secondary, doc_proof) 
+               VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s) RETURNING id""",
+            (seller.name, seller.phone, seller.location, seller.email, seller.businessType, seller.regNumber, 
+             seller.doc_primary, seller.doc_secondary, seller.doc_proof)
+        )
+        new_id = cursor.fetchone()[0]
+        conn.commit()
+        conn.close()
+        
+        details = f"New {seller.businessType} Registration\nName: {seller.name}\nDocs Uploaded: Yes\nAction: VERIFY DOCUMENTS IN DASHBOARD"
+        background_tasks.add_task(send_email_alert, "New Seller KYC Registration", details)
+        
+        return {"status": "success", "message": "Registration received", "sellerId": new_id}
+    except Exception as e:
+        return {"status": "error", "detail": str(e)}
+
+@app.post("/api/marketplace/submit")
+def submit_listing(item: MarketListing, background_tasks: BackgroundTasks):
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        
+        # 1. Ensure Table Exists
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS marketplace_listings (
+                id TEXT PRIMARY KEY,
+                listing_type TEXT,
+                seller_name TEXT,
+                phone TEXT,
+                location TEXT,
+                category TEXT,
+                sub_category TEXT,
+                brand TEXT,
+                model TEXT,
+                price REAL,
+                currency TEXT,
+                specs JSONB,
+                status TEXT DEFAULT 'PENDING_REVIEW',
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        
+        # 2. CHECK VERIFICATION STATUS (The Auto-Publish Logic)
+        cursor.execute("SELECT status FROM sellers WHERE phone = %s", (item.phone,))
+        seller_row = cursor.fetchone()
+        
+        # If seller is found AND status is 'VERIFIED', listing is ACTIVE immediately
+        initial_status = 'ACTIVE' if (seller_row and seller_row[0] == 'VERIFIED') else 'PENDING_REVIEW'
+        
+        # 3. Generate ID and Insert
+        import time
+        import json
+        listing_id = f"LST-{int(time.time())}"
+        specs_json = json.dumps(item.specs)
+        
+        cursor.execute("""
+            INSERT INTO marketplace_listings 
+            (id, listing_type, seller_name, phone, location, category, sub_category, brand, model, price, currency, specs, status)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+        """, (listing_id, item.listingType, item.sellerName, item.phone, item.location, 
+              item.category, item.subCategory, item.brand, item.model, 
+              item.price, item.currency, specs_json, initial_status))
+        
+        conn.commit()
+        conn.close()
+        
+        # 4. Notification
+        if initial_status == 'ACTIVE':
+             background_tasks.add_task(send_email_alert, "New Listing (Auto-Published)", f"ID: {listing_id}\nSeller: {item.sellerName}\nItem: {item.brand} {item.model}\nStatus: LIVE (Verified Seller)")
+        else:
+             background_tasks.add_task(send_email_alert, "New Listing (Review Needed)", f"ID: {listing_id}\nSeller: {item.sellerName}\nStatus: PENDING")
+        
+        return {"status": "success", "listingId": listing_id, "message": f"Listing is {initial_status}"}
+        
+    except Exception as e:
+        print(f"Marketplace Error: {e}")
         return {"status": "error", "detail": str(e)}
 
 if __name__ == "__main__":
