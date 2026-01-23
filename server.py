@@ -1,4 +1,3 @@
-# server.py
 import psycopg2
 import hashlib
 import smtplib
@@ -98,7 +97,7 @@ class LeaseRequestKP(BaseModel):
     duration: str
 
 class MarketListing(BaseModel):
-    listingType: str  # 'SALE', 'RENT', 'PART'
+    listingType: str  
     sellerName: str
     phone: str
     location: str
@@ -110,7 +109,6 @@ class MarketListing(BaseModel):
     currency: str
     specs: dict
 
-# --- NEW: SELLER VERIFICATION MODELS ---
 class SellerCheck(BaseModel):
     phone: str
 
@@ -120,12 +118,11 @@ class SellerRegistration(BaseModel):
     phone: str
     location: str
     email: str
-    businessType: str  # 'Company' or 'Individual'
-    regNumber: str     # KRA PIN or National ID
-    # New File Paths (In a real app, these would be S3 URLs, here we store filenames/base64)
-    doc_primary: str   # ID Front or Cert of Incorp
-    doc_secondary: str # ID Back or KRA PIN
-    doc_proof: str     # Selfie with Item or Business Permit
+    businessType: str
+    regNumber: str
+    doc_primary: str  
+    doc_secondary: str
+    doc_proof: str 
 
 # --- 3. NOTIFICATION SYSTEM (EMAIL ONLY) ---
 
@@ -204,8 +201,6 @@ async def get_current_user(token: str = Depends(oauth2_scheme)):
 @app.get("/")
 def read_root():
     return {"message": "DAGIV API (Secured) is Online"}
-
-# --- AI CONSULTANT ROUTE (FIXED MODEL NAME) ---
 @app.post("/api/ai-consultant")
 def ask_ai_engineer(req: AIChatRequest):
     if not ai_client:
@@ -220,8 +215,6 @@ def ask_ai_engineer(req: AIChatRequest):
         )
         
         full_prompt = f"{system_instruction}\n\nUSER QUESTION: {req.prompt}"
-        
-        # FIX: Using specific model version 'gemini-1.5-flash-001'
         response = ai_client.models.generate_content(
             model="gemini-1.5-flash-001", 
             contents=full_prompt
@@ -257,8 +250,6 @@ def login(login_data: LoginRequest):
         expires_delta=access_token_expires
     )
     return {"access_token": access_token, "token_type": "bearer", "role": db_role}
-
-# --- PROTECTED ROUTES WITH BACKGROUND NOTIFICATIONS ---
 
 @app.post("/api/book-inspection")
 def book_inspection(request: InspectionRequest, background_tasks: BackgroundTasks):
@@ -498,8 +489,6 @@ def submit_listing(item: MarketListing, background_tasks: BackgroundTasks):
     try:
         conn = get_db_connection()
         cursor = conn.cursor()
-        
-        # 1. Ensure Table Exists
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS marketplace_listings (
                 id TEXT PRIMARY KEY,
@@ -518,15 +507,10 @@ def submit_listing(item: MarketListing, background_tasks: BackgroundTasks):
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """)
-        
-        # 2. CHECK VERIFICATION STATUS (The Auto-Publish Logic)
         cursor.execute("SELECT status FROM sellers WHERE phone = %s", (item.phone,))
         seller_row = cursor.fetchone()
-        
-        # If seller is found AND status is 'VERIFIED', listing is ACTIVE immediately
         initial_status = 'ACTIVE' if (seller_row and seller_row[0] == 'VERIFIED') else 'PENDING_REVIEW'
         
-        # 3. Generate ID and Insert
         import time
         import json
         listing_id = f"LST-{int(time.time())}"
@@ -543,7 +527,6 @@ def submit_listing(item: MarketListing, background_tasks: BackgroundTasks):
         conn.commit()
         conn.close()
         
-        # 4. Notification
         if initial_status == 'ACTIVE':
              background_tasks.add_task(send_email_alert, "New Listing (Auto-Published)", f"ID: {listing_id}\nSeller: {item.sellerName}\nItem: {item.brand} {item.model}\nStatus: LIVE (Verified Seller)")
         else:
