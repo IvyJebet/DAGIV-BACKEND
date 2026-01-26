@@ -189,10 +189,11 @@ def initialize_db():
         )
     """)
 
+    # FIXED: Ensure table uses password_hash to match server.py
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS users (
             username TEXT PRIMARY KEY,
-            password TEXT,
+            password_hash TEXT,
             role TEXT,
             email TEXT,
             phone TEXT,
@@ -232,7 +233,6 @@ def initialize_db():
         )
     """)
     
-    # NEW TABLE FOR WEB REQUESTS
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS inspection_requests (
             id SERIAL PRIMARY KEY,
@@ -245,7 +245,6 @@ def initialize_db():
         )
     """)
     
-    # Tables for Web Sync (Phase 1 Integration)
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS consultation_requests (
             id SERIAL PRIMARY KEY,
@@ -272,7 +271,6 @@ def initialize_db():
         )
     """)
     
-    # --- NEW: SELLERS TABLE (If missing) ---
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS sellers (
             id SERIAL PRIMARY KEY,
@@ -290,7 +288,7 @@ def initialize_db():
     cursor.execute("SELECT COUNT(*) FROM users")
     if cursor.fetchone()[0] == 0:
         cursor.execute("""
-            INSERT INTO users (username, password, role, email, phone, security_question, security_answer_hash) 
+            INSERT INTO users (username, password_hash, role, email, phone, security_question, security_answer_hash) 
             VALUES (%s, %s, %s, %s, %s, %s, %s)
         """, ("admin", hash_text("admin"), "admin", "admin@dagiv.co.ke", "0700000000", "Default Question", hash_text("admin")))
     
@@ -444,22 +442,23 @@ def run_main_app(username, role):
                     cons_rows = cur.fetchall()
                 except: cons_rows = []
                 
-                # 4. Fetch Pending Sellers (NEW)
+                # 4. Fetch Pending Sellers
+                # Used a safe try/except block here to prevent crashes if table is missing
                 try:
                     cur.execute("SELECT id, name, phone, email, location, status FROM sellers WHERE status='PENDING'")
                     seller_rows = cur.fetchall()
-                except: seller_rows = []
+                except Exception as e: 
+                    print(f"Error fetching sellers: {e}")
+                    seller_rows = []
 
-                # 5. Fetch Recent Logs (Last 20) with Parsing
+                # 5. Fetch Recent Logs
                 cur.execute("SELECT service_date, vehicle, hours, mileage, remarks FROM service_logs WHERE service_type='Operator Daily Log' ORDER BY id DESC LIMIT 20")
                 raw_logs = cur.fetchall()
                 
                 log_rows_formatted = []
                 for row in raw_logs:
                     r_date, r_veh, r_hrs, r_odo, r_rem = row
-                    op_name = "Unknown"
-                    fuel_val = "0L"
-                    clean_rem = r_rem
+                    op_name = "Unknown"; fuel_val = "0L"; clean_rem = r_rem
                     if r_rem:
                         parts = r_rem.split('|')
                         for p in parts:
@@ -470,11 +469,14 @@ def run_main_app(username, role):
                     log_rows_formatted.append((r_date, r_veh, op_name, f"{r_hrs} hrs", fuel_val, clean_rem))
 
                 conn.close()
+                # Safely update GUI on main thread
                 app.after(0, lambda: _update_trees(insp_rows, serv_rows, cons_rows, log_rows_formatted, seller_rows))
-            except Exception as e: print(e)
+            
+            except Exception as e: 
+                print(f"Web Sync Skipped (Network Issue): {e}")
 
         threading.Thread(target=task, daemon=True).start()
-        app.after(5000, refresh_web_all)
+        app.after(10000, refresh_web_all)
 
     def _update_trees(insp, serv, cons, logs, sellers):
         for t in [insp_tree, serv_tree, cons_tree, op_tree, seller_tree]:
@@ -593,104 +595,97 @@ def run_main_app(username, role):
         for i in tree_plan.get_children(): tree_plan.delete(i)
         if HAS_CALENDAR: planner_cal.calevent_remove('all')
         
+        # FIX: Get the variable value from the MAIN THREAD
+        current_filter_mode = view_filter_var.get()
+        
         def task():
-            conn = connect_db(); cur = conn.cursor()
-            results = []
-            today = datetime.now().date()
-            f_mode = view_filter_var.get()
-
-            # --- MECHANICAL PREDICTION ENGINE ---
-            if f_mode in ["All", "Mechanical"]:
-                cur.execute("SELECT DISTINCT vehicle FROM service_logs")
-                vehs = cur.fetchall()
+            try:
+                conn = connect_db()
+                if not conn: return
+                cur = conn.cursor()
+                results = []
+                today = datetime.now().date()
                 
-                for v_tuple in vehs:
-                    veh = v_tuple[0]
-                    cur.execute("SELECT service_date, mileage, usage_unit, next_service FROM service_logs WHERE vehicle=%s ORDER BY service_date DESC LIMIT 5", (veh,))
-                    logs = cur.fetchall()
+                # FIX: Use the captured variable 'current_filter_mode' instead of calling .get() here
+                f_mode = current_filter_mode
+
+                # --- MECHANICAL PREDICTION ENGINE ---
+                if f_mode in ["All", "Mechanical"]:
+                    cur.execute("SELECT DISTINCT vehicle FROM service_logs")
+                    vehs = cur.fetchall()
                     
-                    if logs:
-                        # Latest Data
-                        last_date_str, current_reading, unit, set_next_service = logs[0]
-                        unit = unit if unit else "km"
-                        current_reading = float(current_reading or 0)
+                    for v_tuple in vehs:
+                        veh = v_tuple[0]
+                        cur.execute("SELECT service_date, mileage, usage_unit, next_service FROM service_logs WHERE vehicle=%s ORDER BY service_date DESC LIMIT 5", (veh,))
+                        logs = cur.fetchall()
                         
-                        # 1. Determine Service Interval
-                        interval = 5000 # Default km
-                        if unit == 'mi': interval = 3000
-                        elif unit == 'hrs': interval = 500
-                        
-                        # 2. Determine Next Target
-                        if set_next_service and float(set_next_service) > current_reading:
-                            target_reading = float(set_next_service)
-                        else:
-                            target_reading = (int(current_reading / interval) + 1) * interval
-
-                        remaining = target_reading - current_reading
-                        
-                        # 3. Calculate Daily Usage Rate (Fluid Math)
-                        daily_rate = 0
-                        if len(logs) > 1:
-                            old_date_str, old_reading, _, _ = logs[-1]
-                            try:
-                                d1 = datetime.strptime(last_date_str, "%Y-%m-%d").date()
-                                d2 = datetime.strptime(old_date_str, "%Y-%m-%d").date()
-                                days_diff = (d1 - d2).days
-                                usage_diff = current_reading - float(old_reading or 0)
-                                if days_diff > 0 and usage_diff > 0:
-                                    daily_rate = usage_diff / days_diff
-                            except: pass
-                        
-                        if daily_rate <= 0:
-                            if unit == 'hrs': daily_rate = 8.0 
-                            else: daily_rate = 50.0 
+                        if logs:
+                            last_date_str, current_reading, unit, set_next_service = logs[0]
+                            unit = unit if unit else "km"
+                            current_reading = float(current_reading or 0)
                             
-                        # 4. Predict Date
-                        try:
-                            days_to_service = int(remaining / daily_rate)
-                        except: days_to_service = 30
-                        predicted_date = today + timedelta(days=days_to_service)
-                        
-                        # 5. Status Logic
-                        status = "GREEN"
-                        msg = f"Healthy ({int(remaining)} {unit} left)"
-                        
-                        if remaining < (interval * 0.1) or days_to_service < 7:
-                            status = "RED"
-                            msg = f"SERVICE DUE! ({int(remaining)} {unit})"
-                        elif remaining < (interval * 0.25) or days_to_service < 21:
-                            status = "YELLOW"
-                            msg = f"Upcoming in {days_to_service} days"
+                            interval = 5000 
+                            if unit == 'mi': interval = 3000
+                            elif unit == 'hrs': interval = 500
+                            
+                            if set_next_service and float(set_next_service) > current_reading:
+                                target_reading = float(set_next_service)
+                            else:
+                                target_reading = (int(current_reading / interval) + 1) * interval
 
-                        results.append({"v": veh, "c": f"🔧 {unit.upper()}", "u": status, "a": msg, "d": predicted_date})
+                            remaining = target_reading - current_reading
+                            
+                            # Simple prediction
+                            daily_rate = 50.0 if unit != 'hrs' else 8.0
+                            if len(logs) > 1:
+                                try:
+                                    d1 = datetime.strptime(last_date_str, "%Y-%m-%d").date()
+                                    d2 = datetime.strptime(logs[-1][0], "%Y-%m-%d").date()
+                                    diff = (d1 - d2).days
+                                    usage = current_reading - float(logs[-1][1] or 0)
+                                    if diff > 0: daily_rate = usage / diff
+                                except: pass
 
-            # --- COMPLIANCE ALERTS ---
-            if f_mode in ["All", "Compliance"]:
-                cur.execute("SELECT vehicle, insurance_expiry, inspection_expiry, speed_governor_expiry FROM expiry_alerts")
-                for row in cur.fetchall():
-                    veh, ins, insp, spd = row
-                    checks = [("Ins", ins, "Insurance"), ("Insp", insp, "Inspection"), ("Spd", spd, "Speed Gov")]
-                    for tag, d_str, full in checks:
-                        if d_str:
-                            try:
-                                d_obj = datetime.strptime(d_str, "%Y-%m-%d").date()
-                                days = (d_obj - today).days
-                                urg, msg = "GREEN", f"{tag} OK"
-                                if days < 0: urg, msg = "RED", f"⚠️ {full} EXPIRED"
-                                elif days < 14: urg, msg = "RED", f"{full} Expiring ({days}d)"
-                                elif days < 45: urg, msg = "YELLOW", f"{full} Renewal Soon"
-                                if urg != "GREEN" or f_mode == "Compliance":
-                                    results.append({"v": veh, "c": "📄 Doc", "u": urg, "a": msg, "d": d_obj})
-                            except: pass
-            conn.close()
+                            try: days_to_service = int(remaining / daily_rate)
+                            except: days_to_service = 30
+                            predicted_date = today + timedelta(days=days_to_service)
+                            
+                            status = "GREEN"; msg = f"Healthy ({int(remaining)} {unit})"
+                            if remaining < (interval * 0.1): status = "RED"; msg = "SERVICE DUE!"
+                            elif remaining < (interval * 0.25): status = "YELLOW"; msg = "Service Soon"
 
-            def update():
-                results.sort(key=lambda x: x['d'])
-                for r in results:
-                    tree_plan.insert("", "end", values=(r['v'], r['c'], r['u'], r['a'], r['d'].strftime("%Y-%m-%d")), tags=(r['u'],))
-                    if HAS_CALENDAR and r['u'] in ['RED', 'YELLOW']:
-                        planner_cal.calevent_create(r['d'], f"{r['v']} - {r['a']}", r['u'].lower())
-            app.after(0, update)
+                            results.append({"v": veh, "c": f"🔧 {unit}", "u": status, "a": msg, "d": predicted_date})
+
+                # --- COMPLIANCE ALERTS ---
+                if f_mode in ["All", "Compliance"]:
+                    cur.execute("SELECT vehicle, insurance_expiry, inspection_expiry, speed_governor_expiry FROM expiry_alerts")
+                    for row in cur.fetchall():
+                        veh, ins, insp, spd = row
+                        checks = [("Ins", ins, "Insurance"), ("Insp", insp, "Inspection"), ("Spd", spd, "Speed Gov")]
+                        for tag, d_str, full in checks:
+                            if d_str:
+                                try:
+                                    d_obj = datetime.strptime(d_str, "%Y-%m-%d").date()
+                                    days = (d_obj - today).days
+                                    urg = "GREEN"; msg = f"{tag} OK"
+                                    if days < 0: urg = "RED"; msg = "EXPIRED"
+                                    elif days < 30: urg = "YELLOW"; msg = f"Expiring ({days}d)"
+                                    
+                                    if urg != "GREEN" or f_mode == "Compliance":
+                                        results.append({"v": veh, "c": "📄 Doc", "u": urg, "a": msg, "d": d_obj})
+                                except: pass
+                conn.close()
+
+                def update():
+                    results.sort(key=lambda x: x['d'])
+                    for r in results:
+                        tree_plan.insert("", "end", values=(r['v'], r['c'], r['u'], r['a'], r['d'].strftime("%Y-%m-%d")), tags=(r['u'],))
+                        if HAS_CALENDAR and r['u'] in ['RED', 'YELLOW']:
+                            planner_cal.calevent_create(r['d'], f"{r['v']} - {r['a']}", r['u'].lower())
+                app.after(0, update)
+            except Exception as e:
+                print(f"Planner Sync Error: {e}")
+
         threading.Thread(target=task, daemon=True).start()
     app.after(1000, refresh_smart_planner)
 
@@ -1164,7 +1159,8 @@ def run_main_app(username, role):
             if not u or not p or not r or not sq or not sa: messagebox.showerror("Error", "All fields required."); return
             conn = connect_db(); cur = conn.cursor()
             try:
-                cur.execute("INSERT INTO users (username, password, role, email, phone, security_question, security_answer_hash) VALUES (%s, %s, %s, %s, %s, %s, %s)", (u, hash_text(p), r, e, ph, sq, hash_text(sa)))
+                # FIXED: Use password_hash
+                cur.execute("INSERT INTO users (username, password_hash, role, email, phone, security_question, security_answer_hash) VALUES (%s, %s, %s, %s, %s, %s, %s)", (u, hash_text(p), r, e, ph, sq, hash_text(sa)))
                 conn.commit(); messagebox.showinfo("Success", "User registered."); reg_win.destroy(); refresh_users()
             except psycopg2.IntegrityError: messagebox.showerror("Error", "Username exists.")
             finally: conn.close()
@@ -1188,7 +1184,8 @@ def run_main_app(username, role):
         def do_change():
             if hash_text(ans_entry.get()) != sec_a_hash: messagebox.showerror("Error", "Wrong Security Answer"); return
             if code_entry.get() != code: messagebox.showerror("Error", "Wrong Verification Code"); return
-            c = connect_db(); c.execute("UPDATE users SET password=? WHERE username=?", (hash_text(new_entry.get()), username)); c.commit(); c.close()
+            # FIXED: Use password_hash
+            c = connect_db(); c.execute("UPDATE users SET password_hash=%s WHERE username=%s", (hash_text(new_entry.get()), username)); c.commit(); c.close()
             messagebox.showinfo("Success", "Password Changed"); win.destroy()
         tk.Button(win, text="Update Password", bg="orange", command=do_change).pack(pady=10)
 
@@ -1200,7 +1197,8 @@ def run_main_app(username, role):
         def do_reset():
             u = u_ent.get(); p = p_ent.get()
             if not u or not p: return
-            c = connect_db(); c.execute("UPDATE users SET password=%s WHERE username=%s", (hash_text(p), u))
+            # FIXED: Use password_hash
+            c = connect_db(); c.execute("UPDATE users SET password_hash=%s WHERE username=%s", (hash_text(p), u))
             c.commit(); c.close(); messagebox.showinfo("Success", f"Password reset for {u}"); win.destroy()
         tk.Button(win, text="Reset Password", bg="red", fg="white", command=do_reset).pack(pady=10)
 
@@ -1266,7 +1264,8 @@ def login_window():
             
         try:
             cur = conn.cursor()
-            cur.execute("SELECT role, password FROM users WHERE username=%s", (u,))
+            # FIXED: Use password_hash
+            cur.execute("SELECT role, password_hash FROM users WHERE username=%s", (u,))
             res = cur.fetchone()
             conn.close()
             

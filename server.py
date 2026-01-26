@@ -1,7 +1,9 @@
 import psycopg2
+from psycopg2.extras import RealDictCursor
 import hashlib
 import smtplib
 import ssl
+import uuid
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from fastapi import FastAPI, HTTPException, Depends, status, BackgroundTasks
@@ -14,6 +16,7 @@ import uvicorn
 import os
 from google import genai 
 
+# --- 1. CONFIGURATION ---
 DATABASE_URL = "postgresql://postgres.fzmydgefyoaglnroenae:sB7FRUojV1IyiGxj@aws-1-eu-west-2.pooler.supabase.com:6543/postgres?sslmode=require"
 ADMIN_EMAIL = "jebetivy388@gmail.com" 
 SENDER_EMAIL = "jebetivy388@gmail.com"
@@ -39,9 +42,27 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-oauth2_scheme = OAuth2PasswordBearer(tokenUrl="api/login")
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="api/auth/login")
 
 # --- 2. DATA MODELS ---
+
+class UserRegister(BaseModel):
+    email: str
+    phone: str
+    password: str
+    role: str = "BUYER"
+    business_name: str = None
+
+class LoginRequest(BaseModel):
+    identifier: str 
+    password: str
+
+class Token(BaseModel):
+    access_token: str
+    token_type: str
+    user_id: str
+    role: str
+    username: str
 
 class AIChatRequest(BaseModel):
     prompt: str
@@ -65,15 +86,6 @@ class OperatorLog(BaseModel):
     location: str
     notes: str
     checklist: dict
-
-class LoginRequest(BaseModel):
-    username: str
-    password: str
-
-class Token(BaseModel):
-    access_token: str
-    token_type: str
-    role: str
 
 class ConsultationRequest(BaseModel):
     name: str
@@ -111,6 +123,7 @@ class MarketListing(BaseModel):
 
 class SellerCheck(BaseModel):
     phone: str
+
 class SellerRegistration(BaseModel):
     name: str
     phone: str
@@ -121,11 +134,14 @@ class SellerRegistration(BaseModel):
     doc_primary: str  
     doc_secondary: str
     doc_proof: str 
+    password: str # <--- FIXED: Added Password Field
 
-# --- 3. NOTIFICATION SYSTEM (EMAIL ONLY) ---
+# --- 3. NOTIFICATION SYSTEM ---
 
 def send_email_alert(category: str, details: str):
+    # Check if password is still the placeholder
     if "REPLACE_THIS" in SENDER_PASSWORD:
+        print("❌ Email skipped: Password not configured.")
         return
 
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -187,18 +203,118 @@ async def get_current_user(token: str = Depends(oauth2_scheme)):
     )
     try:
         payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
-        username: str = payload.get("sub")
-        if username is None:
+        user_id: str = payload.get("sub") # In login we store user_id in sub sometimes, or username
+        # Ideally store ID in sub or custom field. Let's align with login.
+        if user_id is None:
             raise credentials_exception
+        # Return a dict
+        return {"user_id": user_id, "role": payload.get("role")}
     except JWTError:
         raise credentials_exception
-    return username
+
+def require_role(required_role: str):
+    def role_checker(user = Depends(get_current_user)):
+        # Allow ADMIN to access everything, otherwise check role
+        if user["role"] != required_role and user["role"] != "ADMIN":
+            raise HTTPException(status_code=403, detail=f"Access denied. Requires {required_role}")
+        return user
+    return role_checker
 
 # --- 5. ROUTES ---
 
 @app.get("/")
 def read_root():
     return {"message": "DAGIV API (Secured) is Online"}
+
+@app.post("/api/auth/register", response_model=Token)
+def register_user(user: UserRegister):
+    conn = get_db_connection()
+    cursor = conn.cursor(cursor_factory=RealDictCursor)
+    
+    try:
+        if user.role not in ['BUYER', 'SELLER', 'COURIER']:
+             raise HTTPException(status_code=400, detail="Invalid role selected")
+        
+        # Check existing
+        cursor.execute("SELECT id FROM users WHERE email = %s OR phone = %s", (user.email, user.phone))
+        if cursor.fetchone():
+            raise HTTPException(status_code=400, detail="Email or Phone already registered")
+            
+        hashed_pw = hash_text(user.password)
+        # Generate UUID for ID
+        new_uuid = str(uuid.uuid4())
+        
+        cursor.execute("""
+            INSERT INTO users (id, email, phone, password_hash, role, is_verified, username)
+            VALUES (%s, %s, %s, %s, %s, %s, %s)
+            RETURNING id, role
+        """, (new_uuid, user.email, user.phone, hashed_pw, user.role, False, user.email.split('@')[0]))
+        
+        new_user = cursor.fetchone()
+        new_user_id = new_user['id']
+        
+        # Create Wallet
+        cursor.execute("""
+            INSERT INTO wallets (user_id, balance_available, balance_pending, currency)
+            VALUES (%s, 0.00, 0.00, 'KES')
+        """, (new_user_id,))
+        
+        if user.role == 'SELLER':
+            cursor.execute("INSERT INTO sellers (name, phone, email, status) VALUES (%s, %s, %s, 'PENDING')", 
+                           (user.business_name or "New Seller", user.phone, user.email))
+
+        conn.commit()
+        access_token = create_access_token(
+            data={"sub": str(new_user_id), "role": user.role}
+        )
+        return {
+            "access_token": access_token, 
+            "token_type": "bearer", 
+            "user_id": str(new_user_id),
+            "role": user.role,
+            "username": user.email.split('@')[0]
+        }
+
+    except Exception as e:
+        conn.rollback()
+        print(f"Registration Error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        conn.close()
+
+@app.post("/api/auth/login", response_model=Token)
+@app.post("/api/login", response_model=Token)
+def login(login_data: LoginRequest):
+    conn = get_db_connection()
+    cursor = conn.cursor(cursor_factory=RealDictCursor)
+    
+    # Check both tables or just users? We moved to users table for auth.
+    cursor.execute("SELECT id, username, password_hash, role FROM users WHERE username=%s OR email=%s", (login_data.identifier, login_data.identifier))
+    user = cursor.fetchone()
+    conn.close()
+
+    if not user:
+        raise HTTPException(status_code=400, detail="Invalid credentials")
+    
+    # Check Password
+    if hash_text(login_data.password) != user['password_hash']:
+        raise HTTPException(status_code=400, detail="Invalid credentials")
+
+    # Generate Token
+    access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+    access_token = create_access_token(
+        data={"sub": str(user['id']), "role": user['role']}, 
+        expires_delta=access_token_expires
+    )
+    
+    return {
+        "access_token": access_token, 
+        "token_type": "bearer", 
+        "user_id": str(user['id']),
+        "role": user['role'],
+        "username": user['username'] or "User"
+    }
+
 @app.post("/api/ai-consultant")
 def ask_ai_engineer(req: AIChatRequest):
     if not ai_client:
@@ -226,28 +342,6 @@ def ask_ai_engineer(req: AIChatRequest):
             "status": "error", 
             "response": "Our AI Consultant is currently offline. Please contact our human engineers."
         }
-
-@app.post("/api/login", response_model=Token)
-def login(login_data: LoginRequest):
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    cursor.execute("SELECT username, password, role FROM users WHERE username=%s", (login_data.username,))
-    user = cursor.fetchone()
-    conn.close()
-
-    if not user:
-        raise HTTPException(status_code=400, detail="Incorrect username or password")
-    
-    db_username, db_password_hash, db_role = user
-    if hash_text(login_data.password) != db_password_hash:
-        raise HTTPException(status_code=400, detail="Incorrect username or password")
-
-    access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
-    access_token = create_access_token(
-        data={"sub": db_username, "role": db_role}, 
-        expires_delta=access_token_expires
-    )
-    return {"access_token": access_token, "token_type": "bearer", "role": db_role}
 
 @app.post("/api/book-inspection")
 def book_inspection(request: InspectionRequest, background_tasks: BackgroundTasks):
@@ -280,7 +374,7 @@ def book_inspection(request: InspectionRequest, background_tasks: BackgroundTask
         return {"status": "error", "detail": str(e)}
     
 @app.post("/api/operator-logs")
-def submit_log(log: OperatorLog, background_tasks: BackgroundTasks, current_user: str = Depends(get_current_user)):
+def submit_log(log: OperatorLog, background_tasks: BackgroundTasks, current_user: dict = Depends(get_current_user)):
     try:
         conn = get_db_connection()
         cursor = conn.cursor()
@@ -458,29 +552,68 @@ def check_seller_status(check: SellerCheck):
     else:
         return {"exists": False, "status": "UNKNOWN"}
 
+# --- FIXED: SELLER REGISTRATION WITH LOGIN CREATION ---
 @app.post("/api/sellers/register")
 def register_seller(seller: SellerRegistration, background_tasks: BackgroundTasks):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    
     try:
-        conn = get_db_connection()
-        cursor = conn.cursor()
+        # 1. Create User Account (Login Credentials)
+        # Check if user already exists
+        cursor.execute("SELECT id FROM users WHERE email = %s OR phone = %s", (seller.email, seller.phone))
+        existing_user = cursor.fetchone()
         
+        if existing_user:
+            # User exists, maybe upgrading? We will proceed to create seller profile
+            final_user_id = existing_user[0]
+        else:
+            # Create new user
+            user_uuid = str(uuid.uuid4())
+            hashed_pw = hash_text(seller.password)
+            cursor.execute(
+                """INSERT INTO users (id, username, email, phone, password_hash, role, is_verified)
+                   VALUES (%s, %s, %s, %s, %s, 'SELLER', FALSE)
+                   RETURNING id""",
+                (user_uuid, seller.email.split('@')[0], seller.email, seller.phone, hashed_pw)
+            )
+            final_user_id = cursor.fetchone()[0]
+
+        # 2. Create/Update Seller Profile (KYC Data)
         cursor.execute(
             """INSERT INTO sellers 
-               (name, phone, location, email, business_type, reg_number, doc_primary, doc_secondary, doc_proof) 
-               VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s) RETURNING id""",
+               (name, phone, location, email, business_type, reg_number, doc_primary, doc_secondary, doc_proof, status) 
+               VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, 'PENDING') 
+               ON CONFLICT (phone) DO UPDATE 
+               SET name=EXCLUDED.name, location=EXCLUDED.location, email=EXCLUDED.email, 
+                   doc_primary=EXCLUDED.doc_primary, doc_secondary=EXCLUDED.doc_secondary, doc_proof=EXCLUDED.doc_proof
+               RETURNING id""",
             (seller.name, seller.phone, seller.location, seller.email, seller.businessType, seller.regNumber, 
              seller.doc_primary, seller.doc_secondary, seller.doc_proof)
         )
-        new_id = cursor.fetchone()[0]
+        seller_id = cursor.fetchone()[0]
+
+        # 3. Create Wallet (if not exists)
+        cursor.execute("""
+            INSERT INTO wallets (user_id, balance_available, balance_pending, currency)
+            VALUES (%s, 0.00, 0.00, 'KES')
+            ON CONFLICT (user_id) DO NOTHING
+        """, (final_user_id,))
+        
         conn.commit()
-        conn.close()
         
-        details = f"New {seller.businessType} Registration\nName: {seller.name}\nDocs Uploaded: Yes\nAction: VERIFY DOCUMENTS IN DASHBOARD"
-        background_tasks.add_task(send_email_alert, "New Seller KYC Registration", details)
+        # 4. Notify Admin
+        details = f"New {seller.businessType} Registration\nName: {seller.name}\nPhone: {seller.phone}\nEmail: {seller.email}\nAction: LOGIN TO ADMIN PANEL TO VERIFY"
+        background_tasks.add_task(send_email_alert, "Seller Registration", details)
         
-        return {"status": "success", "message": "Registration received", "sellerId": new_id}
+        return {"status": "success", "message": "Registration received", "sellerId": seller_id}
+        
     except Exception as e:
+        conn.rollback()
+        print(f"Registration Error: {e}")
         return {"status": "error", "detail": str(e)}
+    finally:
+        conn.close()
 
 @app.post("/api/marketplace/submit")
 def submit_listing(item: MarketListing, background_tasks: BackgroundTasks):
@@ -535,6 +668,54 @@ def submit_listing(item: MarketListing, background_tasks: BackgroundTasks):
     except Exception as e:
         print(f"Marketplace Error: {e}")
         return {"status": "error", "detail": str(e)}
+
+@app.get("/api/seller/dashboard")
+def get_seller_dashboard(user: dict = Depends(require_role("SELLER"))):
+    conn = get_db_connection()
+    cursor = conn.cursor(cursor_factory=RealDictCursor)
+    try:
+        # Get phone from user profile to find their listings
+        cursor.execute("SELECT phone FROM users WHERE id = %s", (user['user_id'],))
+        seller_row = cursor.fetchone()
+        if not seller_row:
+            raise HTTPException(status_code=404, detail="Seller profile not found")
+        seller_phone = seller_row['phone']
+        
+        # Wallet
+        cursor.execute("SELECT balance_available, balance_pending, currency FROM wallets WHERE user_id = %s", (user['user_id'],))
+        wallet = cursor.fetchone()
+
+        # Stats
+        cursor.execute("""
+            SELECT 
+                COUNT(*) as total_listings,
+                COUNT(*) FILTER (WHERE status = 'ACTIVE') as active_listings
+            FROM marketplace_listings 
+            WHERE phone = %s
+        """, (seller_phone,))
+        inventory = cursor.fetchone()
+        
+        # Listings
+        cursor.execute("""
+            SELECT id, brand, model, price, currency, status, created_at 
+            FROM marketplace_listings 
+            WHERE phone = %s 
+            ORDER BY created_at DESC 
+            LIMIT 5
+        """, (seller_phone,))
+        recent_listings = cursor.fetchall()
+
+        return {
+            "wallet": wallet,
+            "inventory": inventory,
+            "listings": recent_listings,
+            "performance": {"rating": 4.8, "orders_completed": 0} 
+        }
+    except Exception as e:
+        print(f"Dashboard Error: {e}")
+        raise HTTPException(status_code=500, detail="Failed to load dashboard")
+    finally:
+        conn.close()
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8000)
