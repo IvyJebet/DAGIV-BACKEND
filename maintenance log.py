@@ -1,3 +1,4 @@
+import os
 import psycopg2
 import time
 import sys
@@ -11,18 +12,13 @@ import uuid
 import random
 import string
 import threading
-
-# --- CONFIGURATION: CLOUD DATABASE ---
-# Using Connection Pooler (Port 6543)
-DATABASE_URL = "postgresql://postgres.fzmydgefyoaglnroenae:sB7FRUojV1IyiGxj@aws-1-eu-west-2.pooler.supabase.com:6543/postgres?sslmode=require"
-
-# --- 1. SMART IMPORTS ---
+import queue
+DATABASE_URL = "postgresql://postgres.fzmydgefyoaglnroenae:IvyEngineering2026@aws-1-eu-west-2.pooler.supabase.com:6543/postgres?sslmode=require"
 try:
     from tkcalendar import DateEntry, Calendar
     HAS_CALENDAR = True
 except ImportError:
     HAS_CALENDAR = False
-    # Fallback for DateEntry
     class DateEntry(ttk.Entry):
         def __init__(self, master, **kwargs):
             kwargs.pop('date_pattern', None)
@@ -40,7 +36,6 @@ except ImportError:
             self.delete(0, tk.END)
             self.insert(0, date_obj.strftime("%Y-%m-%d"))
             
-    # Fallback for Calendar
     class Calendar(tk.Frame):
         def __init__(self, master, **kwargs):
             super().__init__(master)
@@ -61,7 +56,6 @@ try:
 except ImportError:
     HAS_PDF = False
 
-# --- 2. CONSTANTS & CONFIG (ALPHABETICAL ORDER) ---
 CURRENCY_LIST = sorted([
     "AED - UAE Dirham", "AUD - Australian Dollar", "BRL - Brazilian Real", 
     "CAD - Canadian Dollar", "CHF - Swiss Franc", "CNY - Chinese Yuan", 
@@ -110,8 +104,6 @@ SERVICE_CATEGORIES = {
 
 MACHINERY_TYPES = ["Tipper Truck", "Excavator (Cat)", "Backhoe Loader", "Grader", "Roller / Compactor", "Bulldozer", "Crane Truck", "Water Bowser"]
 
-# --- 4. HELPERS ---
-
 def hash_text(s: str) -> str:
     return hashlib.sha256((s or "").encode()).hexdigest()
 
@@ -145,8 +137,6 @@ def calculate_daily_usage(vehicle_reg):
         return max(val / days, 5.0) if days > 0 else 50.0
     except: return 50.0
 
-# --- 5. DATABASE UTILS ---
-
 def connect_db():
     try:
         return psycopg2.connect(DATABASE_URL)
@@ -157,7 +147,16 @@ def connect_db():
 def initialize_db():
     conn = connect_db()
     if not conn:
-        messagebox.showerror("Error", "No Internet Connection to Cloud DB")
+        msg = (
+            "Could not connect to the database.\n\n"
+            "If you see 'Tenant or user not found': check your Supabase project is "
+            "active (unpause in dashboard), and that the password in DATABASE_URL is correct.\n\n"
+            "You can set DATABASE_URL in your environment to use a different connection string."
+        )
+        try:
+            messagebox.showerror("Database Error", msg)
+        except Exception:
+            print(msg)
         sys.exit(1)
         
     cursor = conn.cursor()
@@ -189,7 +188,6 @@ def initialize_db():
         )
     """)
 
-    # FIXED: Ensure table uses password_hash to match server.py
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS users (
             username TEXT PRIMARY KEY,
@@ -284,7 +282,6 @@ def initialize_db():
         )
     """)
     
-    # Default Admin
     cursor.execute("SELECT COUNT(*) FROM users")
     if cursor.fetchone()[0] == 0:
         cursor.execute("""
@@ -294,8 +291,6 @@ def initialize_db():
     
     conn.commit()
     conn.close()
-
-# --- 6. MAIN APPLICATION GUI ---
 
 def run_main_app(username, role):
     app = tk.Tk()
@@ -347,8 +342,6 @@ def run_main_app(username, role):
     web_notebook.add(tab_web_serv, text="Vm  Services & Leasing")
     web_notebook.add(tab_web_cons, text="Oc  Engineer Consults")
     web_notebook.add(tab_web_logs, text="📋 Incoming Field Logs")
-
-    # --- 0. SELLER VERIFICATIONS (NEW) ---
     seller_cols = ("ID", "Name", "Phone", "Email", "Location", "Status")
     seller_tree = ttk.Treeview(tab_web_sellers, columns=seller_cols, show="headings", height=15)
     for c in seller_cols: seller_tree.heading(c, text=c); seller_tree.column(c, width=120)
@@ -364,8 +357,6 @@ def run_main_app(username, role):
                 c.commit(); c.close(); refresh_web_all()
     
     tk.Button(tab_web_sellers, text="✅ Approve Seller Account", bg="#28a745", fg="white", command=approve_seller_action).pack(pady=5)
-
-    # --- 1. INSPECTIONS VIEW ---
     insp_cols = ("ID", "Machine", "Client", "Phone", "Date", "Status")
     insp_tree = ttk.Treeview(tab_web_insp, columns=insp_cols, show="headings", height=15)
     for c in insp_cols: insp_tree.heading(c, text=c); insp_tree.column(c, width=100)
@@ -377,10 +368,9 @@ def run_main_app(username, role):
             iid = insp_tree.item(sel[0])['values'][0]
             c = connect_db(); cur = c.cursor()
             cur.execute("UPDATE inspection_requests SET status='Contacted' WHERE id=%s", (iid,))
-            c.commit(); c.close(); refresh_web_all()
+            c.commit(); c.close()
     tk.Button(tab_web_insp, text="✅ Mark Inspection as Handled", command=mark_insp_done).pack(pady=5)
 
-    # --- 2. SERVICES & LEASING VIEW ---
     serv_cols = ("ID", "Type", "Category", "Client", "Phone", "Details", "Status")
     serv_tree = ttk.Treeview(tab_web_serv, columns=serv_cols, show="headings", height=15)
     for c in serv_cols: serv_tree.heading(c, text=c); serv_tree.column(c, width=90)
@@ -393,10 +383,9 @@ def run_main_app(username, role):
             iid = serv_tree.item(sel[0])['values'][0]
             c = connect_db(); cur = c.cursor()
             cur.execute("UPDATE service_inquiries SET status='Contacted' WHERE id=%s", (iid,))
-            c.commit(); c.close(); refresh_web_all()
+            c.commit(); c.close()
     tk.Button(tab_web_serv, text="✅ Mark Inquiry as Handled", command=mark_serv_done).pack(pady=5)
 
-    # --- 3. CONSULTATIONS VIEW ---
     cons_cols = ("ID", "Client", "Type", "Details", "Status")
     cons_tree = ttk.Treeview(tab_web_cons, columns=cons_cols, show="headings", height=15)
     for c in cons_cols: cons_tree.heading(c, text=c)
@@ -409,49 +398,62 @@ def run_main_app(username, role):
             iid = cons_tree.item(sel[0])['values'][0]
             c = connect_db(); cur = c.cursor()
             cur.execute("UPDATE consultation_requests SET status='Contacted' WHERE id=%s", (iid,))
-            c.commit(); c.close(); refresh_web_all()
+            c.commit(); c.close()
     tk.Button(tab_web_cons, text="✅ Mark Consultation as Done", command=mark_cons_done).pack(pady=5)
 
-    # --- 4. OPERATOR LOGS FEED (Read-Only Monitor) ---
     op_cols = ("Date", "Vehicle", "Operator", "Hrs", "Fuel", "Remarks")
     op_tree = ttk.Treeview(tab_web_logs, columns=op_cols, show="headings", height=15)
     for c in op_cols: op_tree.heading(c, text=c)
     op_tree.pack(fill="both", expand=True, padx=5, pady=5)
 
-    # --- UNIFIED DATA FETCHING LOOP ---
+    # =====================
+    # UNIFIED DATA FETCHING
+    # =====================
+    gui_queue = queue.Queue()
+    def _update_trees(insp, serv, cons, logs, sellers):
+        for t in [insp_tree, serv_tree, cons_tree, op_tree, seller_tree]:
+            for i in t.get_children(): t.delete(i)
+        for r in insp: insp_tree.insert("", "end", values=r)
+        for r in serv: serv_tree.insert("", "end", values=r)
+        for r in cons: cons_tree.insert("", "end", values=r)
+        for r in logs: op_tree.insert("", "end", values=r)
+        for r in sellers: seller_tree.insert("", "end", values=r)
+
+    def check_web_queue():
+        try:
+            while True:
+                data = gui_queue.get_nowait()
+                insp, serv, cons, logs, sellers = data
+                _update_trees(insp, serv, cons, logs, sellers)
+        except queue.Empty:
+            pass 
+        finally:
+            app.after(1000, check_web_queue)
+    check_web_queue()
     def refresh_web_all():
         def task():
             try:
                 conn = connect_db()
                 if not conn: return
                 cur = conn.cursor()
-
-                # 1. Fetch Inspections
                 cur.execute("SELECT id, machine_type, contact_person, phone, date, status FROM inspection_requests WHERE status='Pending'")
                 insp_rows = cur.fetchall()
 
-                # 2. Fetch Services/Leases
                 try:
                     cur.execute("SELECT id, request_type, category, client_name, phone, details, status FROM service_inquiries WHERE status='Pending'")
                     serv_rows = cur.fetchall()
                 except: serv_rows = []
 
-                # 3. Fetch Consultations
                 try:
                     cur.execute("SELECT id, name, type, details, status FROM consultation_requests WHERE status='Pending'")
                     cons_rows = cur.fetchall()
                 except: cons_rows = []
                 
-                # 4. Fetch Pending Sellers
-                # Used a safe try/except block here to prevent crashes if table is missing
                 try:
                     cur.execute("SELECT id, name, phone, email, location, status FROM sellers WHERE status='PENDING'")
                     seller_rows = cur.fetchall()
-                except Exception as e: 
-                    print(f"Error fetching sellers: {e}")
-                    seller_rows = []
+                except: seller_rows = []
 
-                # 5. Fetch Recent Logs
                 cur.execute("SELECT service_date, vehicle, hours, mileage, remarks FROM service_logs WHERE service_type='Operator Daily Log' ORDER BY id DESC LIMIT 20")
                 raw_logs = cur.fetchall()
                 
@@ -469,24 +471,12 @@ def run_main_app(username, role):
                     log_rows_formatted.append((r_date, r_veh, op_name, f"{r_hrs} hrs", fuel_val, clean_rem))
 
                 conn.close()
-                # Safely update GUI on main thread
-                app.after(0, lambda: _update_trees(insp_rows, serv_rows, cons_rows, log_rows_formatted, seller_rows))
+                gui_queue.put((insp_rows, serv_rows, cons_rows, log_rows_formatted, seller_rows))
             
             except Exception as e: 
                 print(f"Web Sync Skipped (Network Issue): {e}")
-
         threading.Thread(target=task, daemon=True).start()
         app.after(10000, refresh_web_all)
-
-    def _update_trees(insp, serv, cons, logs, sellers):
-        for t in [insp_tree, serv_tree, cons_tree, op_tree, seller_tree]:
-            for i in t.get_children(): t.delete(i)
-        for r in insp: insp_tree.insert("", "end", values=r)
-        for r in serv: serv_tree.insert("", "end", values=r)
-        for r in cons: cons_tree.insert("", "end", values=r)
-        for r in logs: op_tree.insert("", "end", values=r)
-        for r in sellers: seller_tree.insert("", "end", values=r)
-
     refresh_web_all()
 
     # ==========================================
@@ -494,8 +484,6 @@ def run_main_app(username, role):
     # ==========================================
     planner_frame = ttk.Frame(tab_planner)
     planner_frame.pack(fill="both", expand=True, padx=10, pady=10)
-
-    # 1. CONTROL BAR
     ctrl_frame = ttk.Frame(planner_frame); ctrl_frame.pack(fill="x", pady=5)
     view_filter_var = tk.StringVar(value="All")
     def apply_filter(): refresh_smart_planner()
@@ -504,8 +492,6 @@ def run_main_app(username, role):
     for txt, val in [("🌍 All", "All"), ("🔧 Mechanical", "Mechanical"), ("📄 Compliance", "Compliance")]:
         ttk.Radiobutton(ctrl_frame, text=txt, variable=view_filter_var, value=val, command=apply_filter).pack(side="left", padx=10)
     tk.Button(ctrl_frame, text="🔄 Refresh", command=apply_filter).pack(side="right")
-
-    # 2. SPLIT VIEW
     paned = ttk.PanedWindow(planner_frame, orient="horizontal"); paned.pack(fill="both", expand=True)
     
     def show_vehicle_details(vehicle_reg):
@@ -594,8 +580,7 @@ def run_main_app(username, role):
     def refresh_smart_planner():
         for i in tree_plan.get_children(): tree_plan.delete(i)
         if HAS_CALENDAR: planner_cal.calevent_remove('all')
-        
-        # FIX: Get the variable value from the MAIN THREAD
+
         current_filter_mode = view_filter_var.get()
         
         def task():
@@ -605,11 +590,7 @@ def run_main_app(username, role):
                 cur = conn.cursor()
                 results = []
                 today = datetime.now().date()
-                
-                # FIX: Use the captured variable 'current_filter_mode' instead of calling .get() here
                 f_mode = current_filter_mode
-
-                # --- MECHANICAL PREDICTION ENGINE ---
                 if f_mode in ["All", "Mechanical"]:
                     cur.execute("SELECT DISTINCT vehicle FROM service_logs")
                     vehs = cur.fetchall()
@@ -634,8 +615,6 @@ def run_main_app(username, role):
                                 target_reading = (int(current_reading / interval) + 1) * interval
 
                             remaining = target_reading - current_reading
-                            
-                            # Simple prediction
                             daily_rate = 50.0 if unit != 'hrs' else 8.0
                             if len(logs) > 1:
                                 try:
@@ -655,8 +634,6 @@ def run_main_app(username, role):
                             elif remaining < (interval * 0.25): status = "YELLOW"; msg = "Service Soon"
 
                             results.append({"v": veh, "c": f"🔧 {unit}", "u": status, "a": msg, "d": predicted_date})
-
-                # --- COMPLIANCE ALERTS ---
                 if f_mode in ["All", "Compliance"]:
                     cur.execute("SELECT vehicle, insurance_expiry, inspection_expiry, speed_governor_expiry FROM expiry_alerts")
                     for row in cur.fetchall():
@@ -741,8 +718,6 @@ def run_main_app(username, role):
 
     ttk.Label(input_frame, text="Remarks:").grid(row=7, column=0, sticky="w", pady=5)
     remarks_ent = ttk.Entry(input_frame, width=30); remarks_ent.grid(row=7, column=1, pady=5)
-
-    # --- COMPLIANCE SECTION WITH SMART UPLOAD ---
     ttk.Separator(input_frame, orient="horizontal").grid(row=8, column=0, columnspan=2, sticky="ew", pady=10)
     ttk.Label(input_frame, text="Compliance & Smart Upload", font=("Arial", 9, "bold")).grid(row=9, column=0, columnspan=2)
     
@@ -755,8 +730,6 @@ def run_main_app(username, role):
     
     ttk.Checkbutton(input_frame, text="Speed Gov Expiry", variable=spd_var).grid(row=12, column=0, sticky="w")
     spd_date = DateEntry(input_frame, width=15, date_pattern="yyyy-mm-dd"); spd_date.grid(row=12, column=1, sticky="w")
-
-    # SMART SCAN LOGIC
     def smart_scan_certificate():
         if not HAS_PDF:
             messagebox.showerror("Missing Library", "Please install pypdf to use this feature:\npip install pypdf")
@@ -770,9 +743,6 @@ def run_main_app(username, role):
             text = ""
             for page in reader.pages:
                 text += page.extract_text() + "\n"
-            
-            # 1. Find Vehicle Reg (Kenya format: KCD 123A or KCD 123)
-            # Regex: \bK[A-Z]{2}\s?\d{3}[A-Z]?\b looks for pattern like KCD 892J
             reg_match = re.search(r'\bK[A-Z]{2}\s?\d{3}[A-Z]?\b', text)
             if reg_match:
                 found_reg = reg_match.group(0).replace(" ", "")
@@ -781,12 +751,8 @@ def run_main_app(username, role):
                 messagebox.showinfo("Smart Scan", f"Detected Vehicle: {found_reg}")
             else:
                 messagebox.showwarning("Smart Scan", "Could not detect Vehicle Registration Number.")
-
-            # 2. Find Date (dd/mm/yyyy or dd-mm-yyyy or dd.mm.yyyy)
             text_lower = text.lower()
             date_matches = re.findall(r'\d{2}[/.-]\d{2}[/.-]\d{4}', text)
-            
-            # Simple heuristic: The latest date in the future is likely the expiry
             future_dates = []
             today = datetime.now()
             for d_str in date_matches:
@@ -797,9 +763,8 @@ def run_main_app(username, role):
                 except: pass
             
             if future_dates:
-                best_date = max(future_dates) # Furthest date is usually expiry
-                
-                # 3. Guess Type
+                best_date = max(future_dates)
+            
                 if any(x in text_lower for x in ['insurance', 'policy', 'britam', 'jubilee', 'apa', 'cic']):
                     ins_var.set(True)
                     ins_date.set_date(best_date)
@@ -820,7 +785,6 @@ def run_main_app(username, role):
         except Exception as e:
             messagebox.showerror("Parse Error", f"Failed to read file: {str(e)}")
 
-    # Upload Button
     btn_scan = tk.Button(input_frame, text="📂 Upload Certificate (Auto-Fill)", bg="#6f42c1", fg="white", font=("Arial", 9, "bold"), command=smart_scan_certificate)
     btn_scan.grid(row=13, column=0, columnspan=2, sticky="ew", pady=10)
 
@@ -868,7 +832,6 @@ def run_main_app(username, role):
 
     def save_entry():
         veh = vehicle_ent.get(); svc = item_combo.get()
-        # Allow saving compliance even if service is empty, but warn if vehicle missing
         if not veh: messagebox.showerror("Error", "Vehicle Reg required"); return
         
         conn = connect_db(); cur = conn.cursor()
@@ -876,7 +839,6 @@ def run_main_app(username, role):
         today_str = datetime.now().strftime("%Y-%m-%d")
         
         try:
-            # 1. Save Service Log if Service Item is selected
             if svc:
                 if edit_id_var.get():
                     cur.execute("UPDATE service_logs SET vehicle=%s, service_type=%s, service_date=%s, cost=%s, currency=%s, mileage=%s, usage_unit=%s, next_service=%s, remarks=%s WHERE id=%s",
@@ -889,7 +851,6 @@ def run_main_app(username, role):
             else:
                 msg = "Compliance Updated"
 
-            # 2. Save Compliance
             if ins_var.get() or insp_var.get() or spd_var.get():
                 cur.execute("INSERT INTO expiry_alerts (vehicle) VALUES (%s) ON CONFLICT (vehicle) DO NOTHING", (veh,))
                 if ins_var.get(): cur.execute("UPDATE expiry_alerts SET insurance_expiry=%s, last_alert_date=%s WHERE vehicle=%s", (ins_date.get(), today_str, veh))
@@ -1134,7 +1095,7 @@ def run_main_app(username, role):
     # ==========================================
     # TAB 5: ACCOUNT & USER MANAGEMENT
     # ==========================================
-    def logout(): app.destroy(); login_window()
+    def logout(): app.destroy() 
 
     def refresh_users():
         if 'users_tree' not in locals() and 'users_tree' not in globals(): return
@@ -1149,7 +1110,7 @@ def run_main_app(username, role):
         reg_win = tk.Toplevel(app); reg_win.title("Register New User"); reg_win.geometry("400x350")
         tk.Label(reg_win, text="Username").grid(row=0, column=0, sticky="e", pady=5, padx=5); user_entry = tk.Entry(reg_win); user_entry.grid(row=0, column=1, pady=5, padx=5)
         tk.Label(reg_win, text="Password").grid(row=1, column=0, sticky="e", pady=5, padx=5); pass_entry = tk.Entry(reg_win, show="*"); pass_entry.grid(row=1, column=1, pady=5, padx=5)
-        tk.Label(reg_win, text="Role").grid(row=2, column=0, sticky="e", pady=5, padx=5); role_var = tk.StringVar(value="mechanic"); ttk.Combobox(reg_win, textvariable=role_var, values=["admin", "mechanic"], state="readonly").grid(row=2, column=1, pady=5, padx=5)
+        tk.Label(reg_win, text="Role").grid(row=2, column=0, sticky="e", pady=5, padx=5); role_var = tk.StringVar(value="admin"); ttk.Combobox(reg_win, textvariable=role_var, values=["Admin", "Mechanic", "Operator"], state="readonly").grid(row=2, column=1, pady=5, padx=5)
         tk.Label(reg_win, text="Email").grid(row=3, column=0, sticky="e", pady=5, padx=5); email_entry = tk.Entry(reg_win); email_entry.grid(row=3, column=1, pady=5, padx=5)
         tk.Label(reg_win, text="Phone").grid(row=4, column=0, sticky="e", pady=5, padx=5); phone_entry = tk.Entry(reg_win); phone_entry.grid(row=4, column=1, pady=5, padx=5)
         tk.Label(reg_win, text="Security Question").grid(row=5, column=0, sticky="e", pady=5, padx=5); secq_entry = tk.Entry(reg_win, width=30); secq_entry.grid(row=5, column=1, pady=5, padx=5)
@@ -1159,7 +1120,6 @@ def run_main_app(username, role):
             if not u or not p or not r or not sq or not sa: messagebox.showerror("Error", "All fields required."); return
             conn = connect_db(); cur = conn.cursor()
             try:
-                # FIXED: Use password_hash
                 cur.execute("INSERT INTO users (username, password_hash, role, email, phone, security_question, security_answer_hash) VALUES (%s, %s, %s, %s, %s, %s, %s)", (u, hash_text(p), r, e, ph, sq, hash_text(sa)))
                 conn.commit(); messagebox.showinfo("Success", "User registered."); reg_win.destroy(); refresh_users()
             except psycopg2.IntegrityError: messagebox.showerror("Error", "Username exists.")
@@ -1184,7 +1144,6 @@ def run_main_app(username, role):
         def do_change():
             if hash_text(ans_entry.get()) != sec_a_hash: messagebox.showerror("Error", "Wrong Security Answer"); return
             if code_entry.get() != code: messagebox.showerror("Error", "Wrong Verification Code"); return
-            # FIXED: Use password_hash
             c = connect_db(); c.execute("UPDATE users SET password_hash=%s WHERE username=%s", (hash_text(new_entry.get()), username)); c.commit(); c.close()
             messagebox.showinfo("Success", "Password Changed"); win.destroy()
         tk.Button(win, text="Update Password", bg="orange", command=do_change).pack(pady=10)
@@ -1197,7 +1156,6 @@ def run_main_app(username, role):
         def do_reset():
             u = u_ent.get(); p = p_ent.get()
             if not u or not p: return
-            # FIXED: Use password_hash
             c = connect_db(); c.execute("UPDATE users SET password_hash=%s WHERE username=%s", (hash_text(p), u))
             c.commit(); c.close(); messagebox.showinfo("Success", f"Password reset for {u}"); win.destroy()
         tk.Button(win, text="Reset Password", bg="red", fg="white", command=do_reset).pack(pady=10)
@@ -1238,13 +1196,12 @@ def run_main_app(username, role):
     refresh_tree(); load_expiry(); refresh_inventory()
     if role == "admin": refresh_users()
     app.mainloop()
-
-# --- 7. LOGIN SCREEN ---
 def login_window():
     root = tk.Tk()
     root.title("Login - DAGIV ENGINEERING ERP")
     root.geometry("400x350")
-    
+    credentials = {"username": None, "role": None}
+
     ttk.Label(root, text="DAGIV ERP (Cloud Edition)", font=("Arial", 16, "bold")).pack(pady=20)
     
     frame = ttk.Frame(root); frame.pack()
@@ -1255,8 +1212,6 @@ def login_window():
     
     def check_login():
         u = user_ent.get(); p = pass_ent.get()
-        
-        # Connect to Supabase
         conn = connect_db()
         if not conn:
             messagebox.showerror("Error", "No Internet Connection or Database Offline")
@@ -1264,14 +1219,14 @@ def login_window():
             
         try:
             cur = conn.cursor()
-            # FIXED: Use password_hash
             cur.execute("SELECT role, password_hash FROM users WHERE username=%s", (u,))
             res = cur.fetchone()
             conn.close()
             
             if res and res[1] == hash_text(p): 
+                credentials["username"] = u
+                credentials["role"] = res[0]
                 root.destroy()
-                run_main_app(u, res[0])
             else: 
                 messagebox.showerror("Error", "Invalid Credentials")
         except Exception as e:
@@ -1279,7 +1234,20 @@ def login_window():
             
     tk.Button(root, text="LOGIN", bg="#007bff", fg="white", width=20, command=check_login).pack(pady=20)
     root.mainloop()
+    
+    return credentials["username"], credentials["role"]
 
 if __name__ == "__main__":
-    initialize_db()
-    login_window()
+    _root = tk.Tk()
+    _root.withdraw()
+    try:
+        initialize_db()
+    finally:
+        _root.destroy()
+    
+    while True:
+        user_id, user_role = login_window()
+        if user_id and user_role:
+            run_main_app(user_id, user_role)
+        else:
+            break

@@ -17,10 +17,10 @@ import os
 from google import genai 
 
 # --- 1. CONFIGURATION ---
-DATABASE_URL = "postgresql://postgres.fzmydgefyoaglnroenae:sB7FRUojV1IyiGxj@aws-1-eu-west-2.pooler.supabase.com:6543/postgres?sslmode=require"
-ADMIN_EMAIL = "jebetivy388@gmail.com" 
-SENDER_EMAIL = "jebetivy388@gmail.com"
-SENDER_PASSWORD = "eupb xbce wbwa espe" 
+DATABASE_URL = "postgresql://postgres.fzmydgefyoaglnroenae:IvyEngineering2026@aws-1-eu-west-2.pooler.supabase.com:6543/postgres?sslmode=require"
+ADMIN_EMAIL = "dagivengineering@gmail.com" 
+SENDER_EMAIL = "dagivengineering@gmail.com"
+SENDER_PASSWORD = "rlcn kqim otgr kgcd" 
 SECRET_KEY = "DAGIV_SUPER_SECRET_KEY_CHANGE_THIS_IN_PROD"
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = 60 * 24 
@@ -232,16 +232,13 @@ def register_user(user: UserRegister):
     cursor = conn.cursor(cursor_factory=RealDictCursor)
     
     try:
-        if user.role not in ['BUYER', 'SELLER', 'COURIER']:
-             raise HTTPException(status_code=400, detail="Invalid role selected")
-        
-        # Check existing
+        if user.role not in ['BUYER', 'SELLER', 'COURIER', 'OPERATOR', 'MECHANIC']:
+             raise HTTPException(status_code=400, detail=f"Invalid role selected: {user.role}")
         cursor.execute("SELECT id FROM users WHERE email = %s OR phone = %s", (user.email, user.phone))
         if cursor.fetchone():
             raise HTTPException(status_code=400, detail="Email or Phone already registered")
             
         hashed_pw = hash_text(user.password)
-        # Generate UUID for ID
         new_uuid = str(uuid.uuid4())
         
         cursor.execute("""
@@ -252,14 +249,30 @@ def register_user(user: UserRegister):
         
         new_user = cursor.fetchone()
         new_user_id = new_user['id']
-        
-        # Create Wallet
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS wallets (
+                id SERIAL PRIMARY KEY,
+                user_id TEXT UNIQUE,
+                balance_available REAL DEFAULT 0.00,
+                balance_pending REAL DEFAULT 0.00,
+                currency TEXT DEFAULT 'KES'
+            )
+        """)
         cursor.execute("""
             INSERT INTO wallets (user_id, balance_available, balance_pending, currency)
             VALUES (%s, 0.00, 0.00, 'KES')
         """, (new_user_id,))
         
         if user.role == 'SELLER':
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS sellers (
+                    id SERIAL PRIMARY KEY,
+                    name TEXT,
+                    phone TEXT UNIQUE,
+                    email TEXT,
+                    status TEXT DEFAULT 'PENDING'
+                )
+            """)
             cursor.execute("INSERT INTO sellers (name, phone, email, status) VALUES (%s, %s, %s, 'PENDING')", 
                            (user.business_name or "New Seller", user.phone, user.email))
 
@@ -287,20 +300,16 @@ def register_user(user: UserRegister):
 def login(login_data: LoginRequest):
     conn = get_db_connection()
     cursor = conn.cursor(cursor_factory=RealDictCursor)
-    
-    # Check both tables or just users? We moved to users table for auth.
     cursor.execute("SELECT id, username, password_hash, role FROM users WHERE username=%s OR email=%s", (login_data.identifier, login_data.identifier))
     user = cursor.fetchone()
     conn.close()
 
     if not user:
         raise HTTPException(status_code=400, detail="Invalid credentials")
-    
-    # Check Password
     if hash_text(login_data.password) != user['password_hash']:
         raise HTTPException(status_code=400, detail="Invalid credentials")
 
-    # Generate Token
+
     access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
     access_token = create_access_token(
         data={"sub": str(user['id']), "role": user['role']}, 
@@ -718,4 +727,19 @@ def get_seller_dashboard(user: dict = Depends(require_role("SELLER"))):
         conn.close()
 
 if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    port = int(os.environ.get("PORT", 8000))
+    for attempt in range(port, min(port + 10, 65535)):
+        try:
+            uvicorn.run(app, host="0.0.0.0", port=attempt)
+            break
+        except OSError as e:
+            err = getattr(e, "errno", None)
+            winerr = getattr(e, "winerror", None)
+            if err in (98, 10048) or winerr == 10048:  # port in use (Unix / Windows)
+                if attempt == port:
+                    print(f"Port {attempt} in use, trying next...")
+                port = attempt + 1
+                continue
+            raise
+    else:
+        print("No available port in range. Free port 8000 or set PORT=8001 (etc.)")
