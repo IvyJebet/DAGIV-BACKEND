@@ -13,12 +13,17 @@ import random
 import string
 import threading
 import queue
+
+# --- CONFIGURATION ---
 DATABASE_URL = "postgresql://postgres.fzmydgefyoaglnroenae:IvyEngineering2026@aws-1-eu-west-2.pooler.supabase.com:6543/postgres?sslmode=require"
+
+# --- 1. SMART IMPORTS ---
 try:
     from tkcalendar import DateEntry, Calendar
     HAS_CALENDAR = True
 except ImportError:
     HAS_CALENDAR = False
+    # Fallback for DateEntry
     class DateEntry(ttk.Entry):
         def __init__(self, master, **kwargs):
             kwargs.pop('date_pattern', None)
@@ -36,6 +41,7 @@ except ImportError:
             self.delete(0, tk.END)
             self.insert(0, date_obj.strftime("%Y-%m-%d"))
             
+    # Fallback for Calendar
     class Calendar(tk.Frame):
         def __init__(self, master, **kwargs):
             super().__init__(master)
@@ -56,6 +62,7 @@ try:
 except ImportError:
     HAS_PDF = False
 
+# --- 2. CONSTANTS & CONFIG ---
 CURRENCY_LIST = sorted([
     "AED - UAE Dirham", "AUD - Australian Dollar", "BRL - Brazilian Real", 
     "CAD - Canadian Dollar", "CHF - Swiss Franc", "CNY - Chinese Yuan", 
@@ -104,6 +111,8 @@ SERVICE_CATEGORIES = {
 
 MACHINERY_TYPES = ["Tipper Truck", "Excavator (Cat)", "Backhoe Loader", "Grader", "Roller / Compactor", "Bulldozer", "Crane Truck", "Water Bowser"]
 
+# --- 4. HELPERS ---
+
 def hash_text(s: str) -> str:
     return hashlib.sha256((s or "").encode()).hexdigest()
 
@@ -137,6 +146,8 @@ def calculate_daily_usage(vehicle_reg):
         return max(val / days, 5.0) if days > 0 else 50.0
     except: return 50.0
 
+# --- 5. DATABASE UTILS ---
+
 def connect_db():
     try:
         return psycopg2.connect(DATABASE_URL)
@@ -147,16 +158,7 @@ def connect_db():
 def initialize_db():
     conn = connect_db()
     if not conn:
-        msg = (
-            "Could not connect to the database.\n\n"
-            "If you see 'Tenant or user not found': check your Supabase project is "
-            "active (unpause in dashboard), and that the password in DATABASE_URL is correct.\n\n"
-            "You can set DATABASE_URL in your environment to use a different connection string."
-        )
-        try:
-            messagebox.showerror("Database Error", msg)
-        except Exception:
-            print(msg)
+        messagebox.showerror("Error", "No Internet Connection to Cloud DB")
         sys.exit(1)
         
     cursor = conn.cursor()
@@ -282,6 +284,7 @@ def initialize_db():
         )
     """)
     
+    # Default Admin
     cursor.execute("SELECT COUNT(*) FROM users")
     if cursor.fetchone()[0] == 0:
         cursor.execute("""
@@ -291,6 +294,8 @@ def initialize_db():
     
     conn.commit()
     conn.close()
+
+# --- 6. MAIN APPLICATION GUI ---
 
 def run_main_app(username, role):
     app = tk.Tk()
@@ -342,6 +347,8 @@ def run_main_app(username, role):
     web_notebook.add(tab_web_serv, text="Vm  Services & Leasing")
     web_notebook.add(tab_web_cons, text="Oc  Engineer Consults")
     web_notebook.add(tab_web_logs, text="📋 Incoming Field Logs")
+
+    # --- 0. SELLER VERIFICATIONS (NEW) ---
     seller_cols = ("ID", "Name", "Phone", "Email", "Location", "Status")
     seller_tree = ttk.Treeview(tab_web_sellers, columns=seller_cols, show="headings", height=15)
     for c in seller_cols: seller_tree.heading(c, text=c); seller_tree.column(c, width=120)
@@ -353,10 +360,22 @@ def run_main_app(username, role):
             iid = seller_tree.item(sel[0])['values'][0]
             if messagebox.askyesno("Confirm", "Mark this Seller as VERIFIED?\nThey will be able to post listings immediately."):
                 c = connect_db(); cur = c.cursor()
+                # 1. Update Seller Status
                 cur.execute("UPDATE sellers SET status='VERIFIED' WHERE id=%s", (iid,))
+                
+                # 2. UPDATED: Update User Login Status (So they can log in)
+                cur.execute("""
+                    UPDATE users SET is_verified=TRUE 
+                    WHERE phone IN (SELECT phone FROM sellers WHERE id=%s) 
+                    OR email IN (SELECT email FROM sellers WHERE id=%s)
+                """, (iid, iid))
+                
                 c.commit(); c.close(); refresh_web_all()
+                messagebox.showinfo("Success", "Seller Verified & Login Activated")
     
     tk.Button(tab_web_sellers, text="✅ Approve Seller Account", bg="#28a745", fg="white", command=approve_seller_action).pack(pady=5)
+
+    # --- 1. INSPECTIONS VIEW ---
     insp_cols = ("ID", "Machine", "Client", "Phone", "Date", "Status")
     insp_tree = ttk.Treeview(tab_web_insp, columns=insp_cols, show="headings", height=15)
     for c in insp_cols: insp_tree.heading(c, text=c); insp_tree.column(c, width=100)
@@ -371,6 +390,7 @@ def run_main_app(username, role):
             c.commit(); c.close()
     tk.Button(tab_web_insp, text="✅ Mark Inspection as Handled", command=mark_insp_done).pack(pady=5)
 
+    # --- 2. SERVICES & LEASING VIEW ---
     serv_cols = ("ID", "Type", "Category", "Client", "Phone", "Details", "Status")
     serv_tree = ttk.Treeview(tab_web_serv, columns=serv_cols, show="headings", height=15)
     for c in serv_cols: serv_tree.heading(c, text=c); serv_tree.column(c, width=90)
@@ -386,6 +406,7 @@ def run_main_app(username, role):
             c.commit(); c.close()
     tk.Button(tab_web_serv, text="✅ Mark Inquiry as Handled", command=mark_serv_done).pack(pady=5)
 
+    # --- 3. CONSULTATIONS VIEW ---
     cons_cols = ("ID", "Client", "Type", "Details", "Status")
     cons_tree = ttk.Treeview(tab_web_cons, columns=cons_cols, show="headings", height=15)
     for c in cons_cols: cons_tree.heading(c, text=c)
@@ -401,6 +422,7 @@ def run_main_app(username, role):
             c.commit(); c.close()
     tk.Button(tab_web_cons, text="✅ Mark Consultation as Done", command=mark_cons_done).pack(pady=5)
 
+    # --- 4. OPERATOR LOGS FEED (Read-Only Monitor) ---
     op_cols = ("Date", "Vehicle", "Operator", "Hrs", "Fuel", "Remarks")
     op_tree = ttk.Treeview(tab_web_logs, columns=op_cols, show="headings", height=15)
     for c in op_cols: op_tree.heading(c, text=c)
@@ -430,30 +452,39 @@ def run_main_app(username, role):
         finally:
             app.after(1000, check_web_queue)
     check_web_queue()
+    
     def refresh_web_all():
         def task():
             try:
                 conn = connect_db()
                 if not conn: return
                 cur = conn.cursor()
+                
+                # 1. Inspections
                 cur.execute("SELECT id, machine_type, contact_person, phone, date, status FROM inspection_requests WHERE status='Pending'")
                 insp_rows = cur.fetchall()
 
+                # 2. Service Requests
                 try:
                     cur.execute("SELECT id, request_type, category, client_name, phone, details, status FROM service_inquiries WHERE status='Pending'")
                     serv_rows = cur.fetchall()
                 except: serv_rows = []
 
+                # 3. Consultations
                 try:
                     cur.execute("SELECT id, name, type, details, status FROM consultation_requests WHERE status='Pending'")
                     cons_rows = cur.fetchall()
                 except: cons_rows = []
                 
+                # 4. Sellers (UPDATED: Added Error Printing)
                 try:
                     cur.execute("SELECT id, name, phone, email, location, status FROM sellers WHERE status='PENDING'")
                     seller_rows = cur.fetchall()
-                except: seller_rows = []
+                except Exception as e:
+                    print(f"Error fetching sellers: {e}")
+                    seller_rows = []
 
+                # 5. Logs
                 cur.execute("SELECT service_date, vehicle, hours, mileage, remarks FROM service_logs WHERE service_type='Operator Daily Log' ORDER BY id DESC LIMIT 20")
                 raw_logs = cur.fetchall()
                 
@@ -475,6 +506,7 @@ def run_main_app(username, role):
             
             except Exception as e: 
                 print(f"Web Sync Skipped (Network Issue): {e}")
+                
         threading.Thread(target=task, daemon=True).start()
         app.after(10000, refresh_web_all)
     refresh_web_all()
@@ -1196,13 +1228,16 @@ def run_main_app(username, role):
     refresh_tree(); load_expiry(); refresh_inventory()
     if role == "admin": refresh_users()
     app.mainloop()
+
 def login_window():
     root = tk.Tk()
     root.title("Login - DAGIV ENGINEERING ERP")
     root.geometry("400x350")
-    credentials = {"username": None, "role": None}
+    
+    # Store credentials to return to main loop
+    login_data = {}
 
-    ttk.Label(root, text="DAGIV ERP (Cloud Edition)", font=("Arial", 16, "bold")).pack(pady=20)
+    ttk.Label(root, text="DAGIV ERP (Admin)", font=("Arial", 16, "bold")).pack(pady=20)
     
     frame = ttk.Frame(root); frame.pack()
     ttk.Label(frame, text="Username:").grid(row=0, column=0)
@@ -1213,19 +1248,18 @@ def login_window():
     def check_login():
         u = user_ent.get(); p = pass_ent.get()
         conn = connect_db()
-        if not conn:
-            messagebox.showerror("Error", "No Internet Connection or Database Offline")
-            return
-            
+        if not conn: return
+        
         try:
             cur = conn.cursor()
+            # [FIX] Use password_hash instead of password
             cur.execute("SELECT role, password_hash FROM users WHERE username=%s", (u,))
             res = cur.fetchone()
             conn.close()
             
             if res and res[1] == hash_text(p): 
-                credentials["username"] = u
-                credentials["role"] = res[0]
+                login_data["username"] = u
+                login_data["role"] = res[0]
                 root.destroy()
             else: 
                 messagebox.showerror("Error", "Invalid Credentials")
@@ -1234,10 +1268,10 @@ def login_window():
             
     tk.Button(root, text="LOGIN", bg="#007bff", fg="white", width=20, command=check_login).pack(pady=20)
     root.mainloop()
-    
-    return credentials["username"], credentials["role"]
+    return login_data.get("username"), login_data.get("role")
 
 if __name__ == "__main__":
+    # Create hidden root for initialization
     _root = tk.Tk()
     _root.withdraw()
     try:
@@ -1246,8 +1280,8 @@ if __name__ == "__main__":
         _root.destroy()
     
     while True:
-        user_id, user_role = login_window()
-        if user_id and user_role:
-            run_main_app(user_id, user_role)
+        u, r = login_window()
+        if u and r:
+            run_main_app(u, r)
         else:
             break
