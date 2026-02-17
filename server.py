@@ -36,7 +36,11 @@ app = FastAPI()
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000", "http://127.0.0.1:3000"], 
+    # Add 5173 (Vite's default port) to this list
+    allow_origins=[
+        "http://localhost:30001", "http://127.0.0.1:30001",
+        "http://localhost:5173", "http://127.0.0.1:5173"
+    ], 
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -195,6 +199,11 @@ def create_access_token(data: dict, expires_delta: timedelta | None = None):
     encoded_jwt = jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
     return encoded_jwt
 
+# Update imports to include logging
+import logging
+
+# ... (inside your helper functions section)
+
 async def get_current_user(token: str = Depends(oauth2_scheme)):
     credentials_exception = HTTPException(
         status_code=status.HTTP_401_UNAUTHORIZED,
@@ -202,14 +211,23 @@ async def get_current_user(token: str = Depends(oauth2_scheme)):
         headers={"WWW-Authenticate": "Bearer"},
     )
     try:
+        # PRINT THE TOKEN (For debugging only - remove in production!)
+        print(f"🔍 Received Token: {token[:10]}...{token[-10:]}") 
+
         payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
-        user_id: str = payload.get("sub") # In login we store user_id in sub sometimes, or username
-        # Ideally store ID in sub or custom field. Let's align with login.
+        user_id: str = payload.get("sub")
+        role: str = payload.get("role")
+        
+        print(f"✅ Token Decoded: User={user_id}, Role={role}") # Debug success
+
         if user_id is None:
+            print("❌ Error: Token missing 'sub' (User ID)")
             raise credentials_exception
-        # Return a dict
-        return {"user_id": user_id, "role": payload.get("role")}
-    except JWTError:
+            
+        return {"user_id": user_id, "role": role}
+        
+    except JWTError as e:
+        print(f"❌ Token Validation Failed: {str(e)}") # <--- THIS IS THE KEY LINE
         raise credentials_exception
 
 def require_role(required_role: str):
