@@ -18,6 +18,9 @@ import json
 from google import genai
 from typing import Optional
 
+# --- NEW IMPORT ---
+from mpesa_services import MpesaService
+
 # --- 1. CONFIGURATION ---
 DATABASE_URL = "postgresql://postgres.fzmydgefyoaglnroenae:IvyEngineering2026@aws-1-eu-west-2.pooler.supabase.com:6543/postgres?sslmode=require"
 ADMIN_EMAIL = "dagivengineering@gmail.com" 
@@ -153,6 +156,12 @@ class OrderCreate(BaseModel):
 class OrderStatusUpdate(BaseModel):
     status: str 
 
+# --- NEW MODEL FOR MPESA ---
+class MpesaPaymentRequest(BaseModel):
+    order_id: str
+    phone_number: str
+    amount: float
+
 # --- 3. NOTIFICATION SYSTEM ---
 
 def send_email_alert(category: str, details: str):
@@ -255,7 +264,7 @@ def startup_db():
     conn = get_db_connection()
     cursor = conn.cursor()
     
-    # 1. Orders Table Creation (If not exists)
+    # 1. Orders Table
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS orders (
             id TEXT PRIMARY KEY,
@@ -269,29 +278,38 @@ def startup_db():
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     """)
-
-    # --- MIGRATION FIX: Force add listing_id if missing ---
-    try:
-        # This fixes the "column o.listing_id does not exist" error
-        cursor.execute("ALTER TABLE orders ADD COLUMN IF NOT EXISTS listing_id TEXT")
-        conn.commit()
-        print("✅ Database Migration: Checked/Added listing_id column.")
-    except Exception as e:
-        print(f"⚠️ Migration warning: {e}")
-        conn.rollback()
-    # -------------------------------------------------------
-
-    # 2. Transactions Table
+    
+    # 2. Transactions Table (Updated for M-Pesa)
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS transactions (
             id TEXT PRIMARY KEY,
             order_id TEXT,
             amount REAL,
             type TEXT, 
-            status TEXT,
+            status TEXT DEFAULT 'PENDING',
+            checkout_request_id TEXT,  -- For M-Pesa Tracking
+            mpesa_receipt TEXT,        -- Confirmed Receipt No
+            phone_number TEXT,
             timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     """)
+    
+    # 3. Migration: Add columns if they don't exist
+    try:
+        # Ensure order listing_id exists
+        cursor.execute("ALTER TABLE orders ADD COLUMN IF NOT EXISTS listing_id TEXT")
+        
+        # Ensure new M-Pesa transaction columns exist
+        cursor.execute("ALTER TABLE transactions ADD COLUMN IF NOT EXISTS checkout_request_id TEXT")
+        cursor.execute("ALTER TABLE transactions ADD COLUMN IF NOT EXISTS mpesa_receipt TEXT")
+        cursor.execute("ALTER TABLE transactions ADD COLUMN IF NOT EXISTS phone_number TEXT")
+        
+        conn.commit()
+        print("✅ Database Migration: Checked/Added columns.")
+    except Exception as e:
+        print(f"⚠️ Migration warning: {e}")
+        conn.rollback()
+        
     conn.commit()
     conn.close()
 
@@ -974,6 +992,33 @@ def get_public_listings():
         return []
     finally:
         conn.close()
+
+# --- NEW PAYMENT ENDPOINT ---
+@app.post("/api/payments/mpesa/pay")
+def trigger_mpesa_payment(req: MpesaPaymentRequest, background_tasks: BackgroundTasks):
+    mpesa = MpesaService()
+    
+    # 1. Trigger STK Push
+    # Note: Amount must be INT for M-Pesa
+    response = mpesa.stk_push(req.phone_number, int(req.amount), req.order_id)
+    
+    if "ResponseCode" in response and response["ResponseCode"] == "0":
+        # 2. Log Transaction state
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        trx_id = f"TRX-{uuid.uuid4().hex[:8].upper()}"
+        
+        cursor.execute("""
+            INSERT INTO transactions (id, order_id, amount, type, status, checkout_request_id, phone_number)
+            VALUES (%s, %s, %s, 'PAYMENT_INITIATED', 'PROCESSING', %s, %s)
+        """, (trx_id, req.order_id, req.amount, response['CheckoutRequestID'], req.phone_number))
+        
+        conn.commit()
+        conn.close()
+        
+        return {"status": "success", "message": "STK Push Sent", "checkoutRequestId": response['CheckoutRequestID']}
+    else:
+        return {"status": "error", "detail": response.get("errorMessage", "Failed to initiate M-Pesa")}
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8000)
