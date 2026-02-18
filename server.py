@@ -150,10 +150,12 @@ class OrderCreate(BaseModel):
     duration: int = 1 # For rentals (days)
     shipping_cost: float = 0.0
 
+class OrderStatusUpdate(BaseModel):
+    status: str 
+
 # --- 3. NOTIFICATION SYSTEM ---
 
 def send_email_alert(category: str, details: str):
-    # Check if password is still the placeholder
     if "REPLACE_THIS" in SENDER_PASSWORD:
         print("❌ Email skipped: Password not configured.")
         return
@@ -212,8 +214,6 @@ def create_access_token(data: dict, expires_delta: timedelta | None = None):
 # Update imports to include logging
 import logging
 
-# ... (inside your helper functions section)
-
 async def get_current_user(token: str = Depends(oauth2_scheme)):
     credentials_exception = HTTPException(
         status_code=status.HTTP_401_UNAUTHORIZED,
@@ -228,7 +228,7 @@ async def get_current_user(token: str = Depends(oauth2_scheme)):
         user_id: str = payload.get("sub")
         role: str = payload.get("role")
         
-        print(f"✅ Token Decoded: User={user_id}, Role={role}") # Debug success
+        print(f"✅ Token Decoded: User={user_id}, Role={role}") 
 
         if user_id is None:
             print("❌ Error: Token missing 'sub' (User ID)")
@@ -237,7 +237,7 @@ async def get_current_user(token: str = Depends(oauth2_scheme)):
         return {"user_id": user_id, "role": role}
         
     except JWTError as e:
-        print(f"❌ Token Validation Failed: {str(e)}") # <--- THIS IS THE KEY LINE
+        print(f"❌ Token Validation Failed: {str(e)}") 
         raise credentials_exception
 
 def require_role(required_role: str):
@@ -254,7 +254,8 @@ def require_role(required_role: str):
 def startup_db():
     conn = get_db_connection()
     cursor = conn.cursor()
-    # 1. Orders Table
+    
+    # 1. Orders Table Creation (If not exists)
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS orders (
             id TEXT PRIMARY KEY,
@@ -268,7 +269,19 @@ def startup_db():
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     """)
-    # 2. Transactions Table (The Ledger)
+
+    # --- MIGRATION FIX: Force add listing_id if missing ---
+    try:
+        # This fixes the "column o.listing_id does not exist" error
+        cursor.execute("ALTER TABLE orders ADD COLUMN IF NOT EXISTS listing_id TEXT")
+        conn.commit()
+        print("✅ Database Migration: Checked/Added listing_id column.")
+    except Exception as e:
+        print(f"⚠️ Migration warning: {e}")
+        conn.rollback()
+    # -------------------------------------------------------
+
+    # 2. Transactions Table
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS transactions (
             id TEXT PRIMARY KEY,
@@ -684,11 +697,24 @@ def register_seller(seller: SellerRegistration, background_tasks: BackgroundTask
     finally:
         conn.close()
 
+# --- MARKETPLACE SUBMIT (UPDATED) ---
 @app.post("/api/marketplace/submit")
-def submit_listing(item: MarketListing, background_tasks: BackgroundTasks):
+def submit_listing(item: MarketListing, background_tasks: BackgroundTasks, user: dict = Depends(get_current_user)):
     try:
         conn = get_db_connection()
         cursor = conn.cursor()
+        
+        # 1. SECURITY: Fetch the actual phone number from the User Profile using the token ID
+        cursor.execute("SELECT phone FROM users WHERE id = %s", (user['user_id'],))
+        user_row = cursor.fetchone()
+        
+        if not user_row:
+            raise HTTPException(status_code=404, detail="User profile not found. Please re-login.")
+            
+        # 2. ENFORCEMENT: Override the payload phone with the verified database phone
+        db_phone = user_row[0]
+        item.phone = db_phone # <--- This ensures exact match with profile for Dashboard visibility
+
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS marketplace_listings (
                 id TEXT PRIMARY KEY,
@@ -707,9 +733,9 @@ def submit_listing(item: MarketListing, background_tasks: BackgroundTasks):
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """)
-        cursor.execute("SELECT status FROM sellers WHERE phone = %s", (item.phone,))
-        seller_row = cursor.fetchone()
-        initial_status = 'ACTIVE' if (seller_row and seller_row[0] == 'VERIFIED') else 'PENDING_REVIEW'
+        
+        # 3. LOGIC CHANGE: Force status to ACTIVE immediately (Bypassing Review)
+        initial_status = 'ACTIVE' 
         
         import time
         import json
@@ -727,12 +753,10 @@ def submit_listing(item: MarketListing, background_tasks: BackgroundTasks):
         conn.commit()
         conn.close()
         
-        if initial_status == 'ACTIVE':
-             background_tasks.add_task(send_email_alert, "New Listing (Auto-Published)", f"ID: {listing_id}\nSeller: {item.sellerName}\nItem: {item.brand} {item.model}\nStatus: LIVE (Verified Seller)")
-        else:
-             background_tasks.add_task(send_email_alert, "New Listing (Review Needed)", f"ID: {listing_id}\nSeller: {item.sellerName}\nStatus: PENDING")
+        # Notify Admin (Just for info, since it's already live)
+        background_tasks.add_task(send_email_alert, "New Listing (Live)", f"ID: {listing_id}\nSeller: {item.sellerName}\nPhone: {item.phone}\nItem: {item.brand} {item.model}\nStatus: LIVE")
         
-        return {"status": "success", "listingId": listing_id, "message": f"Listing is {initial_status}"}
+        return {"status": "success", "listingId": listing_id, "message": "Listing is now LIVE"}
         
     except Exception as e:
         print(f"Marketplace Error: {e}")
@@ -834,11 +858,6 @@ def create_order(order: OrderCreate, background_tasks: BackgroundTasks, user: di
     finally:
         conn.close()
 
-# --- ADD TO server.py ---
-
-class OrderStatusUpdate(BaseModel):
-    status: str # 'PROCESSING', 'SHIPPED', 'COMPLETED', 'CANCELLED'
-
 @app.get("/api/seller/orders")
 def get_seller_orders(user: dict = Depends(require_role("SELLER"))):
     conn = get_db_connection()
@@ -907,15 +926,13 @@ def update_order_status(order_id: str, update: OrderStatusUpdate, background_tas
     finally:
         conn.close()
 
-# --- ADD THIS TO server.py ---
-
+# --- MARKETPLACE LISTING FETCH (CRITICAL ADDITION) ---
 @app.get("/api/marketplace/listings")
 def get_public_listings():
     conn = get_db_connection()
     cursor = conn.cursor(cursor_factory=RealDictCursor)
     try:
-        # Fetch only ACTIVE listings (Verified Sellers)
-        # We use aliases (AS) to match the Frontend 'MarketItem' interface (camelCase)
+        # Fetch only ACTIVE listings
         cursor.execute("""
             SELECT 
                 id, 
@@ -938,20 +955,18 @@ def get_public_listings():
         """)
         listings = cursor.fetchall()
         
-        # Parse the JSON 'specs' field back into a dictionary for the frontend
+        # Parse JSON specs
         for item in listings:
             if isinstance(item['specs'], str):
                 import json
                 item['specs'] = json.loads(item['specs'])
                 
-                # Extract images for the card view
                 if 'images' in item['specs'] and len(item['specs']['images']) > 0:
                     item['images'] = item['specs']['images']
                 else:
-                    item['images'] = ["https://via.placeholder.com/300?text=No+Image"] # Fallback
+                    item['images'] = ["https://via.placeholder.com/300?text=No+Image"]
 
-                # Map logic for verified tag
-                item['verifiedByDagiv'] = True # Since status is ACTIVE (Verified Seller)
+                item['verifiedByDagiv'] = True
 
         return listings
     except Exception as e:
@@ -959,6 +974,6 @@ def get_public_listings():
         return []
     finally:
         conn.close()
-if __name__ == "__main__":
 
+if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8000)
