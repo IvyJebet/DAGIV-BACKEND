@@ -14,7 +14,9 @@ from datetime import datetime, timedelta
 from jose import JWTError, jwt
 import uvicorn
 import os
-from google import genai 
+import json
+from google import genai
+from typing import Optional
 
 # --- 1. CONFIGURATION ---
 DATABASE_URL = "postgresql://postgres.fzmydgefyoaglnroenae:IvyEngineering2026@aws-1-eu-west-2.pooler.supabase.com:6543/postgres?sslmode=require"
@@ -39,7 +41,8 @@ app.add_middleware(
     # Add 5173 (Vite's default port) to this list
     allow_origins=[
         "http://localhost:30001", "http://127.0.0.1:30001",
-        "http://localhost:5173", "http://127.0.0.1:5173"
+        "http://localhost:5173", "http://127.0.0.1:5173",
+        "http://localhost:3000", "http://127.0.0.1:3000"
     ], 
     allow_credentials=True,
     allow_methods=["*"],
@@ -138,7 +141,14 @@ class SellerRegistration(BaseModel):
     doc_primary: str  
     doc_secondary: str
     doc_proof: str 
-    password: str # <--- FIXED: Added Password Field
+    password: str 
+
+class OrderCreate(BaseModel):
+    listing_id: str
+    quantity: int
+    payment_method: str # 'MPESA', 'BANK'
+    duration: int = 1 # For rentals (days)
+    shipping_cost: float = 0.0
 
 # --- 3. NOTIFICATION SYSTEM ---
 
@@ -239,6 +249,38 @@ def require_role(required_role: str):
     return role_checker
 
 # --- 5. ROUTES ---
+
+@app.on_event("startup")
+def startup_db():
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    # 1. Orders Table
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS orders (
+            id TEXT PRIMARY KEY,
+            buyer_id TEXT,
+            seller_phone TEXT,
+            listing_id TEXT,
+            amount REAL,
+            currency TEXT,
+            status TEXT DEFAULT 'PENDING_PAYMENT',
+            payment_method TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+    # 2. Transactions Table (The Ledger)
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS transactions (
+            id TEXT PRIMARY KEY,
+            order_id TEXT,
+            amount REAL,
+            type TEXT, 
+            status TEXT,
+            timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+    conn.commit()
+    conn.close()
 
 @app.get("/")
 def read_root():
@@ -744,20 +786,179 @@ def get_seller_dashboard(user: dict = Depends(require_role("SELLER"))):
     finally:
         conn.close()
 
+# --- 6. ORDER & TRANSACTION ROUTES ---
+
+@app.post("/api/orders/create")
+def create_order(order: OrderCreate, background_tasks: BackgroundTasks, user: dict = Depends(get_current_user)):
+    conn = get_db_connection()
+    cursor = conn.cursor(cursor_factory=RealDictCursor)
+    try:
+        # 1. Get Listing Details
+        cursor.execute("SELECT price, currency, seller_name, phone, listing_type FROM marketplace_listings WHERE id = %s", (order.listing_id,))
+        listing = cursor.fetchone()
+        if not listing:
+            raise HTTPException(status_code=404, detail="Listing not found")
+            
+        # 2. Calculate Total
+        base_price = listing['price']
+        total = (base_price * order.quantity * order.duration) + order.shipping_cost
+        
+        # 3. Create Order ID
+        order_id = f"ORD-{uuid.uuid4().hex[:8].upper()}"
+        
+        # 4. Save Order
+        cursor.execute("""
+            INSERT INTO orders (id, buyer_id, seller_phone, listing_id, amount, currency, status, payment_method)
+            VALUES (%s, %s, %s, %s, %s, %s, 'PENDING_PAYMENT', %s)
+        """, (order_id, user['user_id'], listing['phone'], order.listing_id, total, listing['currency'], order.payment_method))
+        
+        # 5. Log Transaction (Ledger)
+        trans_id = f"TRX-{uuid.uuid4().hex[:8].upper()}"
+        cursor.execute("""
+            INSERT INTO transactions (id, order_id, amount, type, status)
+            VALUES (%s, %s, %s, 'ESCROW_DEPOSIT', 'PENDING')
+        """, (trans_id, order_id, total))
+        
+        conn.commit()
+        
+        # 6. Notify
+        details = f"Order: {order_id}\nItem: {listing['listing_type']}\nAmount: {listing['currency']} {total}\nBuyer ID: {user['user_id']}"
+        background_tasks.add_task(send_email_alert, "New Order Created", details)
+        
+        return {"status": "success", "orderId": order_id, "amount": total, "currency": listing['currency']}
+        
+    except Exception as e:
+        conn.rollback()
+        print(f"Order Error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        conn.close()
+
+# --- ADD TO server.py ---
+
+class OrderStatusUpdate(BaseModel):
+    status: str # 'PROCESSING', 'SHIPPED', 'COMPLETED', 'CANCELLED'
+
+@app.get("/api/seller/orders")
+def get_seller_orders(user: dict = Depends(require_role("SELLER"))):
+    conn = get_db_connection()
+    cursor = conn.cursor(cursor_factory=RealDictCursor)
+    try:
+        # Get seller's phone to identify their orders
+        cursor.execute("SELECT phone FROM users WHERE id = %s", (user['user_id'],))
+        seller = cursor.fetchone()
+        if not seller: raise HTTPException(status_code=404, detail="Seller not found")
+        
+        # Fetch Orders where this user is the seller
+        cursor.execute("""
+            SELECT 
+                o.id, o.amount, o.currency, o.status, o.created_at,
+                o.payment_method, u.email as buyer_contact,
+                l.brand, l.model, l.listing_type
+            FROM orders o
+            JOIN marketplace_listings l ON o.listing_id = l.id
+            JOIN users u ON o.buyer_id = u.id
+            WHERE o.seller_phone = %s
+            ORDER BY o.created_at DESC
+        """, (seller['phone'],))
+        
+        orders = cursor.fetchall()
+        return orders
+    except Exception as e:
+        print(f"Order Fetch Error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        conn.close()
+
+@app.post("/api/orders/{order_id}/update-status")
+def update_order_status(order_id: str, update: OrderStatusUpdate, background_tasks: BackgroundTasks, user: dict = Depends(require_role("SELLER"))):
+    conn = get_db_connection()
+    cursor = conn.cursor(cursor_factory=RealDictCursor)
+    try:
+        # 1. Verify this order belongs to the seller
+        cursor.execute("SELECT phone FROM users WHERE id = %s", (user['user_id'],))
+        seller_phone = cursor.fetchone()['phone']
+        
+        cursor.execute("SELECT id, status, amount, buyer_id FROM orders WHERE id = %s AND seller_phone = %s", (order_id, seller_phone))
+        order = cursor.fetchone()
+        
+        if not order:
+            raise HTTPException(status_code=404, detail="Order not found or access denied")
+            
+        # 2. Update Status
+        cursor.execute("UPDATE orders SET status = %s WHERE id = %s", (update.status, order_id))
+        if update.status == 'COMPLETED':
+            cursor.execute("""
+                UPDATE wallets 
+                SET balance_pending = balance_pending - %s, 
+                    balance_available = balance_available + %s 
+                WHERE user_id = %s
+            """, (order['amount'], order['amount'], user['user_id']))
+            
+        conn.commit()
+        
+        # 4. Notify
+        background_tasks.add_task(send_email_alert, f"Order {update.status}", f"Order {order_id} marked as {update.status} by Seller.")
+        
+        return {"status": "success", "new_state": update.status}
+    except Exception as e:
+        conn.rollback()
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        conn.close()
+
+# --- ADD THIS TO server.py ---
+
+@app.get("/api/marketplace/listings")
+def get_public_listings():
+    conn = get_db_connection()
+    cursor = conn.cursor(cursor_factory=RealDictCursor)
+    try:
+        # Fetch only ACTIVE listings (Verified Sellers)
+        # We use aliases (AS) to match the Frontend 'MarketItem' interface (camelCase)
+        cursor.execute("""
+            SELECT 
+                id, 
+                listing_type as "listingType", 
+                seller_name as "sellerName", 
+                phone, 
+                location, 
+                category, 
+                sub_category as "subCategory", 
+                brand, 
+                model, 
+                price, 
+                currency, 
+                specs, 
+                status,
+                created_at 
+            FROM marketplace_listings 
+            WHERE status = 'ACTIVE'
+            ORDER BY created_at DESC
+        """)
+        listings = cursor.fetchall()
+        
+        # Parse the JSON 'specs' field back into a dictionary for the frontend
+        for item in listings:
+            if isinstance(item['specs'], str):
+                import json
+                item['specs'] = json.loads(item['specs'])
+                
+                # Extract images for the card view
+                if 'images' in item['specs'] and len(item['specs']['images']) > 0:
+                    item['images'] = item['specs']['images']
+                else:
+                    item['images'] = ["https://via.placeholder.com/300?text=No+Image"] # Fallback
+
+                # Map logic for verified tag
+                item['verifiedByDagiv'] = True # Since status is ACTIVE (Verified Seller)
+
+        return listings
+    except Exception as e:
+        print(f"Market Fetch Error: {e}")
+        return []
+    finally:
+        conn.close()
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 8000))
-    for attempt in range(port, min(port + 10, 65535)):
-        try:
-            uvicorn.run(app, host="0.0.0.0", port=attempt)
-            break
-        except OSError as e:
-            err = getattr(e, "errno", None)
-            winerr = getattr(e, "winerror", None)
-            if err in (98, 10048) or winerr == 10048:  # port in use (Unix / Windows)
-                if attempt == port:
-                    print(f"Port {attempt} in use, trying next...")
-                port = attempt + 1
-                continue
-            raise
-    else:
-        print("No available port in range. Free port 8000 or set PORT=8001 (etc.)")
+
+    uvicorn.run(app, host="0.0.0.0", port=8000)
