@@ -21,6 +21,7 @@ import logging
 
 # --- NEW IMPORT ---
 from mpesa_services import MpesaService
+from pesapal_services import PesapalService
 
 # --- 1. CONFIGURATION ---
 DATABASE_URL = "postgresql://postgres.fzmydgefyoaglnroenae:IvyEngineering2026@aws-1-eu-west-2.pooler.supabase.com:6543/postgres?sslmode=require"
@@ -42,12 +43,11 @@ app = FastAPI()
 
 app.add_middleware(
     CORSMiddleware,
-    # Kept your original Vite and React ports for dev
     allow_origins=[
         "http://localhost:30001", "http://127.0.0.1:30001",
         "http://localhost:5173", "http://127.0.0.1:5173",
         "http://localhost:3000", "http://127.0.0.1:3000",
-        "*" # Added wildcard as suggested, but keep specific ones above if you lock this down later
+        "*" 
     ], 
     allow_credentials=True,
     allow_methods=["*"],
@@ -151,8 +151,8 @@ class SellerRegistration(BaseModel):
 class OrderCreate(BaseModel):
     listing_id: str
     quantity: int
-    payment_method: str # 'MPESA', 'BANK'
-    duration: int = 1 # For rentals (days)
+    payment_method: str 
+    duration: int = 1 
     shipping_cost: float = 0.0
 
 class OrderStatusUpdate(BaseModel):
@@ -167,9 +167,8 @@ class CartAddRequest(BaseModel):
     listing_id: str
     quantity: int = 1
 
-# --- NEW CHECKOUT & ESCROW MODELS ---
 class CheckoutProcessRequest(BaseModel):
-    payment_method: str # 'MPESA', 'BANK', 'CARD'
+    payment_method: str 
     mpesa_phone: Optional[str] = None
     shipping_details: dict
 
@@ -234,7 +233,6 @@ def create_access_token(data: dict, expires_delta: timedelta | None = None):
     encoded_jwt = jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
     return encoded_jwt
 
-
 async def get_current_user(token: str = Depends(oauth2_scheme)):
     credentials_exception = HTTPException(
         status_code=status.HTTP_401_UNAUTHORIZED,
@@ -256,7 +254,6 @@ async def get_current_user(token: str = Depends(oauth2_scheme)):
 
 def require_role(required_role: str):
     def role_checker(user = Depends(get_current_user)):
-        # Allow ADMIN to access everything, otherwise check role
         if user["role"] != required_role and user["role"] != "ADMIN":
             raise HTTPException(status_code=403, detail=f"Access denied. Requires {required_role}")
         return user
@@ -285,14 +282,14 @@ def startup_db():
         )
     """)
 
-    # 1.5 Order Items Table (For Multi-Item Checkout)
+    # 1.5 Order Line Items Table (FIXED SCHEMA)
     cursor.execute("""
-        CREATE TABLE IF NOT EXISTS order_items (
+        CREATE TABLE IF NOT EXISTS order_line_items (
             id SERIAL PRIMARY KEY,
             order_id TEXT,
             listing_id TEXT,
             quantity INT,
-            unit_price REAL, -- <--- PERMANENT FIX
+            unit_price REAL,
             seller_phone TEXT
         )
     """)
@@ -305,8 +302,8 @@ def startup_db():
             amount REAL,
             type TEXT, 
             status TEXT DEFAULT 'PENDING',
-            checkout_request_id TEXT,  -- For M-Pesa Tracking
-            mpesa_receipt TEXT,        -- Confirmed Receipt No
+            checkout_request_id TEXT,  
+            mpesa_receipt TEXT,        
             phone_number TEXT,
             timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
@@ -333,10 +330,10 @@ def startup_db():
         cursor.execute("ALTER TABLE orders ADD COLUMN IF NOT EXISTS payment_method TEXT")
         cursor.execute("ALTER TABLE orders ADD COLUMN IF NOT EXISTS shipping_details JSONB")
         
-        # PERMANENT FIX for order_items table mismatch
-        cursor.execute("ALTER TABLE order_items ADD COLUMN IF NOT EXISTS unit_price REAL")
+        # Ensure unit_price exists
+        cursor.execute("ALTER TABLE order_line_items ADD COLUMN IF NOT EXISTS unit_price REAL")
         
-        cursor.execute("ALTER TABLE transactions ADD COLUMN IF NOT EXISTS type TEXT")           
+        cursor.execute("ALTER TABLE transactions ADD COLUMN IF NOT EXISTS type TEXT")          
         cursor.execute("ALTER TABLE transactions ALTER COLUMN type TYPE TEXT USING type::text")
         cursor.execute("ALTER TABLE transactions ADD COLUMN IF NOT EXISTS status TEXT DEFAULT 'PENDING'") 
         cursor.execute("ALTER TABLE transactions ALTER COLUMN status TYPE TEXT USING status::text")
@@ -438,7 +435,6 @@ def login(login_data: LoginRequest):
     if hash_text(login_data.password) != user['password_hash']:
         raise HTTPException(status_code=400, detail="Invalid credentials")
 
-
     access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
     access_token = create_access_token(
         data={"sub": str(user['id']), "role": user['role']}, 
@@ -452,17 +448,16 @@ def login(login_data: LoginRequest):
         "role": user['role'],
         "username": user['username'] or "User"
     }
+
 @app.post("/api/cart/add")
 def add_to_cart(req: CartAddRequest, user: dict = Depends(get_current_user)):
     conn = get_db_connection()
     cursor = conn.cursor(cursor_factory=RealDictCursor)
     try:
-        # Verify item exists
         cursor.execute("SELECT id FROM marketplace_listings WHERE id = %s", (req.listing_id,))
         if not cursor.fetchone():
             raise HTTPException(status_code=404, detail="Item not found")
 
-        # Upsert (Insert or Update if exists)
         cursor.execute("""
             INSERT INTO cart_items (user_id, listing_id, quantity)
             VALUES (%s, %s, %s)
@@ -474,7 +469,6 @@ def add_to_cart(req: CartAddRequest, user: dict = Depends(get_current_user)):
         return {"status": "success", "message": "Item added to cart"}
     except Exception as e:
         conn.rollback()
-        # Log the error but don't crash
         print(f"Cart Add Error: {e}")
         raise HTTPException(status_code=500, detail="Failed to add item to cart")
     finally:
@@ -500,7 +494,6 @@ def get_cart(user: dict = Depends(get_current_user)):
             if isinstance(item['specs'], str):
                 item['specs'] = json.loads(item['specs'])
             
-            # Format image
             if 'images' in item['specs'] and len(item['specs']['images']) > 0:
                 item['image'] = item['specs']['images'][0]
             else:
@@ -963,10 +956,10 @@ def process_checkout(req: CheckoutProcessRequest, background_tasks: BackgroundTa
             VALUES (%s, %s, %s, 'KES', 'PENDING_PAYMENT', %s, %s)
         """, (order_id, user['user_id'], total, req.payment_method, json.dumps(req.shipping_details)))
 
-        # 4. Create Order Items (PERMANENT FIX: using unit_price)
+        # 4. Create Order Items (PERMANENT FIX: using order_line_items)
         for item in items:
             cursor.execute("""
-                INSERT INTO order_items (order_id, listing_id, quantity, unit_price, seller_phone)
+                INSERT INTO order_line_items (order_id, listing_id, quantity, unit_price, seller_phone)
                 VALUES (%s, %s, %s, %s, %s)
             """, (order_id, item['listing_id'], item['quantity'], item['price'], item['seller_phone']))
 
@@ -992,19 +985,37 @@ def process_checkout(req: CheckoutProcessRequest, background_tasks: BackgroundTa
             payment_info = {
                 "type": "BANK",
                 "message": "Please transfer funds to the DAGIV Escrow Account below.",
-                "bank": "Equity Bank Kenya",
-                "account_name": "DAGIV Escrow Trust",
-                "account_number": "012345678910",
+                "bank": "KCB Bank Kenya",
+                "account_name": "DAGIV Engineering Ltd",
+                "account_number": "1280877812",
                 "branch": "Industrial Area",
                 "reference": order_id
             }
             
         elif req.payment_method == 'CARD':
-            payment_info = {
-                "type": "CARD",
-                "message": "Redirecting to secure card gateway...",
-                "url": f"https://sandbox.pesapal.com/pay/{order_id}" # Mock URL
-            }
+            # Initialize Pesapal
+            pesapal = PesapalService()
+            
+            # Extract billing details safely
+            email = req.shipping_details.get('email', 'buyer@dagiv.com')
+            phone = req.shipping_details.get('phone', '0700000000')
+            first_name = req.shipping_details.get('firstName', 'Guest')
+            last_name = req.shipping_details.get('lastName', 'User')
+            
+            # Submit to Pesapal
+            res = pesapal.submit_order(order_id, total, phone, email, first_name, last_name)
+            
+            if res and "redirect_url" in res:
+                payment_info = {
+                    "type": "CARD",
+                    "message": "Secure gateway initialized.",
+                    "url": res["redirect_url"] # The real, secure PCI-compliant URL
+                }
+            else:
+                payment_info = {
+                    "type": "ERROR",
+                    "message": "Failed to initialize Pesapal gateway. " + str(res.get('message', ''))
+                }
 
         conn.commit()
         background_tasks.add_task(send_email_alert, "New Order via Checkout", f"Order ID: {order_id}\nTotal: KES {total}\nMethod: {req.payment_method}")
@@ -1027,8 +1038,8 @@ def mock_payment_success(order_id: str):
         cursor.execute("UPDATE orders SET status = 'FUNDS_SECURED' WHERE id = %s RETURNING id", (order_id,))
         if not cursor.fetchone(): raise HTTPException(status_code=404, detail="Order not found")
         
-        # Credit the pending balance of the sellers involved
-        cursor.execute("SELECT seller_phone, unit_price, quantity FROM order_items WHERE order_id = %s", (order_id,))
+        # Credit the pending balance of the sellers involved (FIXED: using order_line_items)
+        cursor.execute("SELECT seller_phone, unit_price, quantity FROM order_line_items WHERE order_id = %s", (order_id,))
         items = cursor.fetchall()
         for item in items:
             item_total = item['unit_price'] * item['quantity']
@@ -1058,8 +1069,8 @@ def release_escrow(order_id: str, user: dict = Depends(get_current_user)):
         # Update order status
         cursor.execute("UPDATE orders SET status = 'RELEASED' WHERE id = %s", (order_id,))
         
-        # Move pending funds to available funds for the seller
-        cursor.execute("SELECT seller_phone, unit_price, quantity FROM order_items WHERE order_id = %s", (order_id,))
+        # Move pending funds to available funds for the seller (FIXED: using order_line_items)
+        cursor.execute("SELECT seller_phone, unit_price, quantity FROM order_line_items WHERE order_id = %s", (order_id,))
         items = cursor.fetchall()
         for item in items:
             item_total = item['unit_price'] * item['quantity']
