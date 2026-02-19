@@ -17,6 +17,7 @@ import os
 import json
 from google import genai
 from typing import Optional
+import logging
 
 # --- NEW IMPORT ---
 from mpesa_services import MpesaService
@@ -41,11 +42,12 @@ app = FastAPI()
 
 app.add_middleware(
     CORSMiddleware,
-    # Add 5173 (Vite's default port) to this list
+    # Kept your original Vite and React ports for dev
     allow_origins=[
         "http://localhost:30001", "http://127.0.0.1:30001",
         "http://localhost:5173", "http://127.0.0.1:5173",
-        "http://localhost:3000", "http://127.0.0.1:3000"
+        "http://localhost:3000", "http://127.0.0.1:3000",
+        "*" # Added wildcard as suggested, but keep specific ones above if you lock this down later
     ], 
     allow_credentials=True,
     allow_methods=["*"],
@@ -156,11 +158,23 @@ class OrderCreate(BaseModel):
 class OrderStatusUpdate(BaseModel):
     status: str 
 
-# --- NEW MODEL FOR MPESA ---
 class MpesaPaymentRequest(BaseModel):
     order_id: str
     phone_number: str
     amount: float
+
+class CartAddRequest(BaseModel):
+    listing_id: str
+    quantity: int = 1
+
+# --- NEW CHECKOUT & ESCROW MODELS ---
+class CheckoutProcessRequest(BaseModel):
+    payment_method: str # 'MPESA', 'BANK', 'CARD'
+    mpesa_phone: Optional[str] = None
+    shipping_details: dict
+
+class EscrowReleaseRequest(BaseModel):
+    order_id: str
 
 # --- 3. NOTIFICATION SYSTEM ---
 
@@ -220,8 +234,6 @@ def create_access_token(data: dict, expires_delta: timedelta | None = None):
     encoded_jwt = jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
     return encoded_jwt
 
-# Update imports to include logging
-import logging
 
 async def get_current_user(token: str = Depends(oauth2_scheme)):
     credentials_exception = HTTPException(
@@ -230,23 +242,16 @@ async def get_current_user(token: str = Depends(oauth2_scheme)):
         headers={"WWW-Authenticate": "Bearer"},
     )
     try:
-        # PRINT THE TOKEN (For debugging only - remove in production!)
-        print(f"🔍 Received Token: {token[:10]}...{token[-10:]}") 
-
         payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
         user_id: str = payload.get("sub")
         role: str = payload.get("role")
         
-        print(f"✅ Token Decoded: User={user_id}, Role={role}") 
-
         if user_id is None:
-            print("❌ Error: Token missing 'sub' (User ID)")
             raise credentials_exception
             
         return {"user_id": user_id, "role": role}
         
     except JWTError as e:
-        print(f"❌ Token Validation Failed: {str(e)}") 
         raise credentials_exception
 
 def require_role(required_role: str):
@@ -275,12 +280,24 @@ def startup_db():
             currency TEXT,
             status TEXT DEFAULT 'PENDING_PAYMENT',
             payment_method TEXT,
+            shipping_details JSONB,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+
+    # 1.5 Order Items Table (For Multi-Item Checkout)
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS order_items (
+            id SERIAL PRIMARY KEY,
+            order_id TEXT,
+            listing_id TEXT,
+            quantity INT,
+            unit_price REAL, -- <--- PERMANENT FIX
+            seller_phone TEXT
         )
     """)
     
     # 2. Transactions Table
-    # FIX: We use TEXT for id since some databases strictly enforce UUID formats.
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS transactions (
             id TEXT PRIMARY KEY,
@@ -294,32 +311,42 @@ def startup_db():
             timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     """)
+
+    # 3. Cart Table
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS cart_items (
+            id SERIAL PRIMARY KEY,
+            user_id TEXT,
+            listing_id TEXT,
+            quantity INT DEFAULT 1,
+            added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE(user_id, listing_id)
+        )
+    """)
     
-    # 3. Migration: Force add ALL new columns if they are missing
+    # 4. Migrations (Self-Healing)
     try:
-        # Update orders table
         cursor.execute("ALTER TABLE orders ADD COLUMN IF NOT EXISTS listing_id TEXT")
         cursor.execute("ALTER TABLE orders ADD COLUMN IF NOT EXISTS seller_phone TEXT")
         cursor.execute("ALTER TABLE orders ADD COLUMN IF NOT EXISTS total_amount REAL") 
         cursor.execute("ALTER TABLE orders ADD COLUMN IF NOT EXISTS currency TEXT")
         cursor.execute("ALTER TABLE orders ADD COLUMN IF NOT EXISTS payment_method TEXT")
+        cursor.execute("ALTER TABLE orders ADD COLUMN IF NOT EXISTS shipping_details JSONB")
         
-        # Update transactions table
+        # PERMANENT FIX for order_items table mismatch
+        cursor.execute("ALTER TABLE order_items ADD COLUMN IF NOT EXISTS unit_price REAL")
+        
         cursor.execute("ALTER TABLE transactions ADD COLUMN IF NOT EXISTS type TEXT")           
-        # FIX FOR ENUM ERROR: Force 'type' and 'status' columns to be standard TEXT
         cursor.execute("ALTER TABLE transactions ALTER COLUMN type TYPE TEXT USING type::text")
-        
         cursor.execute("ALTER TABLE transactions ADD COLUMN IF NOT EXISTS status TEXT DEFAULT 'PENDING'") 
         cursor.execute("ALTER TABLE transactions ALTER COLUMN status TYPE TEXT USING status::text")
-        
         cursor.execute("ALTER TABLE transactions ADD COLUMN IF NOT EXISTS checkout_request_id TEXT")
         cursor.execute("ALTER TABLE transactions ADD COLUMN IF NOT EXISTS mpesa_receipt TEXT")
         cursor.execute("ALTER TABLE transactions ADD COLUMN IF NOT EXISTS phone_number TEXT")
         
         conn.commit()
-        print("✅ Database Migration: Converted ENUM to TEXT and added missing columns to schema.")
     except Exception as e:
-        print(f"⚠️ Migration warning (Safe to ignore if columns already exist/converted): {e}")
+        print(f"Migration Info: {e}")
         conn.rollback()
         
     conn.commit()
@@ -393,7 +420,6 @@ def register_user(user: UserRegister):
 
     except Exception as e:
         conn.rollback()
-        print(f"Registration Error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
     finally:
         conn.close()
@@ -426,6 +452,89 @@ def login(login_data: LoginRequest):
         "role": user['role'],
         "username": user['username'] or "User"
     }
+@app.post("/api/cart/add")
+def add_to_cart(req: CartAddRequest, user: dict = Depends(get_current_user)):
+    conn = get_db_connection()
+    cursor = conn.cursor(cursor_factory=RealDictCursor)
+    try:
+        # Verify item exists
+        cursor.execute("SELECT id FROM marketplace_listings WHERE id = %s", (req.listing_id,))
+        if not cursor.fetchone():
+            raise HTTPException(status_code=404, detail="Item not found")
+
+        # Upsert (Insert or Update if exists)
+        cursor.execute("""
+            INSERT INTO cart_items (user_id, listing_id, quantity)
+            VALUES (%s, %s, %s)
+            ON CONFLICT (user_id, listing_id) 
+            DO UPDATE SET quantity = cart_items.quantity + EXCLUDED.quantity
+        """, (user['user_id'], req.listing_id, req.quantity))
+        
+        conn.commit()
+        return {"status": "success", "message": "Item added to cart"}
+    except Exception as e:
+        conn.rollback()
+        # Log the error but don't crash
+        print(f"Cart Add Error: {e}")
+        raise HTTPException(status_code=500, detail="Failed to add item to cart")
+    finally:
+        conn.close()
+
+@app.get("/api/cart")
+def get_cart(user: dict = Depends(get_current_user)):
+    conn = get_db_connection()
+    cursor = conn.cursor(cursor_factory=RealDictCursor)
+    try:
+        cursor.execute("""
+            SELECT c.listing_id, c.quantity, c.added_at, 
+                   l.brand, l.model, l.price, l.currency, l.specs, l.listing_type, l.seller_name
+            FROM cart_items c
+            JOIN marketplace_listings l ON c.listing_id = l.id
+            WHERE c.user_id = %s
+            ORDER BY c.added_at DESC
+        """, (user['user_id'],))
+        items = cursor.fetchall()
+        
+        total_value = 0
+        for item in items:
+            if isinstance(item['specs'], str):
+                item['specs'] = json.loads(item['specs'])
+            
+            # Format image
+            if 'images' in item['specs'] and len(item['specs']['images']) > 0:
+                item['image'] = item['specs']['images'][0]
+            else:
+                item['image'] = "https://via.placeholder.com/300?text=No+Image"
+            
+            del item['specs'] 
+            total_value += (item['price'] * item['quantity'])
+
+        return {
+            "items": items,
+            "summary": {
+                "item_count": sum(i['quantity'] for i in items),
+                "total_value": total_value,
+                "currency": items[0]['currency'] if items else "KES"
+            }
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        conn.close()
+
+@app.delete("/api/cart/remove/{listing_id}")
+def remove_from_cart(listing_id: str, user: dict = Depends(get_current_user)):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    try:
+        cursor.execute("DELETE FROM cart_items WHERE user_id = %s AND listing_id = %s", (user['user_id'], listing_id))
+        conn.commit()
+        return {"status": "success"}
+    except Exception as e:
+        conn.rollback()
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        conn.close()
 
 @app.post("/api/ai-consultant")
 def ask_ai_engineer(req: AIChatRequest):
@@ -664,7 +773,6 @@ def check_seller_status(check: SellerCheck):
     else:
         return {"exists": False, "status": "UNKNOWN"}
 
-# --- FIXED: SELLER REGISTRATION WITH LOGIN CREATION ---
 @app.post("/api/sellers/register")
 def register_seller(seller: SellerRegistration, background_tasks: BackgroundTasks):
     conn = get_db_connection()
@@ -672,15 +780,12 @@ def register_seller(seller: SellerRegistration, background_tasks: BackgroundTask
     
     try:
         # 1. Create User Account (Login Credentials)
-        # Check if user already exists
         cursor.execute("SELECT id FROM users WHERE email = %s OR phone = %s", (seller.email, seller.phone))
         existing_user = cursor.fetchone()
         
         if existing_user:
-            # User exists, maybe upgrading? We will proceed to create seller profile
             final_user_id = existing_user[0]
         else:
-            # Create new user
             user_uuid = str(uuid.uuid4())
             hashed_pw = hash_text(seller.password)
             cursor.execute(
@@ -691,7 +796,7 @@ def register_seller(seller: SellerRegistration, background_tasks: BackgroundTask
             )
             final_user_id = cursor.fetchone()[0]
 
-        # 2. Create/Update Seller Profile (KYC Data)
+        # 2. Create/Update Seller Profile
         cursor.execute(
             """INSERT INTO sellers 
                (name, phone, location, email, business_type, reg_number, doc_primary, doc_secondary, doc_proof, status) 
@@ -705,7 +810,7 @@ def register_seller(seller: SellerRegistration, background_tasks: BackgroundTask
         )
         seller_id = cursor.fetchone()[0]
 
-        # 3. Create Wallet (if not exists)
+        # 3. Create Wallet
         cursor.execute("""
             INSERT INTO wallets (user_id, balance_available, balance_pending, currency)
             VALUES (%s, 0.00, 0.00, 'KES')
@@ -714,7 +819,6 @@ def register_seller(seller: SellerRegistration, background_tasks: BackgroundTask
         
         conn.commit()
         
-        # 4. Notify Admin
         details = f"New {seller.businessType} Registration\nName: {seller.name}\nPhone: {seller.phone}\nEmail: {seller.email}\nAction: LOGIN TO ADMIN PANEL TO VERIFY"
         background_tasks.add_task(send_email_alert, "Seller Registration", details)
         
@@ -722,28 +826,24 @@ def register_seller(seller: SellerRegistration, background_tasks: BackgroundTask
         
     except Exception as e:
         conn.rollback()
-        print(f"Registration Error: {e}")
         return {"status": "error", "detail": str(e)}
     finally:
         conn.close()
 
-# --- MARKETPLACE SUBMIT (UPDATED) ---
 @app.post("/api/marketplace/submit")
 def submit_listing(item: MarketListing, background_tasks: BackgroundTasks, user: dict = Depends(get_current_user)):
     try:
         conn = get_db_connection()
         cursor = conn.cursor()
         
-        # 1. SECURITY: Fetch the actual phone number from the User Profile using the token ID
         cursor.execute("SELECT phone FROM users WHERE id = %s", (user['user_id'],))
         user_row = cursor.fetchone()
         
         if not user_row:
             raise HTTPException(status_code=404, detail="User profile not found. Please re-login.")
             
-        # 2. ENFORCEMENT: Override the payload phone with the verified database phone
         db_phone = user_row[0]
-        item.phone = db_phone # <--- This ensures exact match with profile for Dashboard visibility
+        item.phone = db_phone 
 
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS marketplace_listings (
@@ -764,7 +864,6 @@ def submit_listing(item: MarketListing, background_tasks: BackgroundTasks, user:
             )
         """)
         
-        # 3. LOGIC CHANGE: Force status to ACTIVE immediately (Bypassing Review)
         initial_status = 'ACTIVE' 
         
         import time
@@ -783,13 +882,11 @@ def submit_listing(item: MarketListing, background_tasks: BackgroundTasks, user:
         conn.commit()
         conn.close()
         
-        # Notify Admin (Just for info, since it's already live)
         background_tasks.add_task(send_email_alert, "New Listing (Live)", f"ID: {listing_id}\nSeller: {item.sellerName}\nPhone: {item.phone}\nItem: {item.brand} {item.model}\nStatus: LIVE")
         
         return {"status": "success", "listingId": listing_id, "message": "Listing is now LIVE"}
         
     except Exception as e:
-        print(f"Marketplace Error: {e}")
         return {"status": "error", "detail": str(e)}
 
 @app.get("/api/seller/dashboard")
@@ -797,18 +894,15 @@ def get_seller_dashboard(user: dict = Depends(require_role("SELLER"))):
     conn = get_db_connection()
     cursor = conn.cursor(cursor_factory=RealDictCursor)
     try:
-        # Get phone from user profile to find their listings
         cursor.execute("SELECT phone FROM users WHERE id = %s", (user['user_id'],))
         seller_row = cursor.fetchone()
         if not seller_row:
             raise HTTPException(status_code=404, detail="Seller profile not found")
         seller_phone = seller_row['phone']
         
-        # Wallet
         cursor.execute("SELECT balance_available, balance_pending, currency FROM wallets WHERE user_id = %s", (user['user_id'],))
         wallet = cursor.fetchone()
 
-        # Stats
         cursor.execute("""
             SELECT 
                 COUNT(*) as total_listings,
@@ -818,7 +912,6 @@ def get_seller_dashboard(user: dict = Depends(require_role("SELLER"))):
         """, (seller_phone,))
         inventory = cursor.fetchone()
         
-        # Listings
         cursor.execute("""
             SELECT id, brand, model, price, currency, status, created_at 
             FROM marketplace_listings 
@@ -835,134 +928,159 @@ def get_seller_dashboard(user: dict = Depends(require_role("SELLER"))):
             "performance": {"rating": 4.8, "orders_completed": 0} 
         }
     except Exception as e:
-        print(f"Dashboard Error: {e}")
         raise HTTPException(status_code=500, detail="Failed to load dashboard")
     finally:
         conn.close()
 
-# --- 6. ORDER & TRANSACTION ROUTES ---
 
-@app.post("/api/orders/create")
-def create_order(order: OrderCreate, background_tasks: BackgroundTasks, user: dict = Depends(get_current_user)):
+# --- 7. NEW ESCROW & CHECKOUT ROUTES ---
+
+@app.post("/api/checkout/process")
+def process_checkout(req: CheckoutProcessRequest, background_tasks: BackgroundTasks, user: dict = Depends(get_current_user)):
     conn = get_db_connection()
     cursor = conn.cursor(cursor_factory=RealDictCursor)
     try:
-        # 1. Get Listing Details
-        cursor.execute("SELECT price, currency, seller_name, phone, listing_type FROM marketplace_listings WHERE id = %s", (order.listing_id,))
-        listing = cursor.fetchone()
-        if not listing:
-            raise HTTPException(status_code=404, detail="Listing not found")
-            
+        # 1. Fetch Cart Items
+        cursor.execute("""
+            SELECT c.listing_id, c.quantity, l.price, l.seller_name, l.phone as seller_phone
+            FROM cart_items c
+            JOIN marketplace_listings l ON c.listing_id = l.id
+            WHERE c.user_id = %s
+        """, (user['user_id'],))
+        items = cursor.fetchall()
+        
+        if not items: raise HTTPException(status_code=400, detail="Cart is empty")
+
         # 2. Calculate Total
-        base_price = listing['price']
-        total = (base_price * order.quantity * order.duration) + order.shipping_cost
-        
-        # 3. Create Order ID
+        subtotal = sum(i['price'] * i['quantity'] for i in items)
+        shipping_cost = 15000.0 # Standard flat rate heavy haulage
+        total = subtotal + shipping_cost
+
+        # 3. Create Main Order
         order_id = f"ORD-{uuid.uuid4().hex[:8].upper()}"
-        
-        # 4. Save Order
         cursor.execute("""
-            INSERT INTO orders (id, buyer_id, seller_phone, listing_id, total_amount, currency, status, payment_method)
-            VALUES (%s, %s, %s, %s, %s, %s, 'PENDING_PAYMENT', %s)
-        """, (order_id, user['user_id'], listing['phone'], order.listing_id, total, listing['currency'], order.payment_method))
-        
-        # 5. Log Transaction (Ledger)
-        trans_id = str(uuid.uuid4())
-        cursor.execute("""
-            INSERT INTO transactions (id, order_id, amount, type, status)
-            VALUES (%s, %s, %s, 'ESCROW_DEPOSIT', 'PENDING')
-        """, (trans_id, order_id, total))
-        
-        conn.commit()
-        
-        # 6. Notify
-        details = f"Order: {order_id}\nItem: {listing['listing_type']}\nAmount: {listing['currency']} {total}\nBuyer ID: {user['user_id']}"
-        background_tasks.add_task(send_email_alert, "New Order Created", details)
-        
-        return {"status": "success", "orderId": order_id, "amount": total, "currency": listing['currency']}
-        
-    except Exception as e:
-        conn.rollback()
-        print(f"Order Error: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-    finally:
-        conn.close()
+            INSERT INTO orders (id, buyer_id, total_amount, currency, status, payment_method, shipping_details)
+            VALUES (%s, %s, %s, 'KES', 'PENDING_PAYMENT', %s, %s)
+        """, (order_id, user['user_id'], total, req.payment_method, json.dumps(req.shipping_details)))
 
-@app.get("/api/seller/orders")
-def get_seller_orders(user: dict = Depends(require_role("SELLER"))):
-    conn = get_db_connection()
-    cursor = conn.cursor(cursor_factory=RealDictCursor)
-    try:
-        # Get seller's phone to identify their orders
-        cursor.execute("SELECT phone FROM users WHERE id = %s", (user['user_id'],))
-        seller = cursor.fetchone()
-        if not seller: raise HTTPException(status_code=404, detail="Seller not found")
-        
-        # Fetch Orders where this user is the seller
-        cursor.execute("""
-            SELECT 
-                o.id, o.total_amount as amount, o.currency, o.status, o.created_at,
-                o.payment_method, u.email as buyer_contact,
-                l.brand, l.model, l.listing_type
-            FROM orders o
-            JOIN marketplace_listings l ON o.listing_id = l.id
-            JOIN users u ON o.buyer_id = u.id
-            WHERE o.seller_phone = %s
-            ORDER BY o.created_at DESC
-        """, (seller['phone'],))
-        
-        orders = cursor.fetchall()
-        return orders
-    except Exception as e:
-        print(f"Order Fetch Error: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-    finally:
-        conn.close()
-
-@app.post("/api/orders/{order_id}/update-status")
-def update_order_status(order_id: str, update: OrderStatusUpdate, background_tasks: BackgroundTasks, user: dict = Depends(require_role("SELLER"))):
-    conn = get_db_connection()
-    cursor = conn.cursor(cursor_factory=RealDictCursor)
-    try:
-        # 1. Verify this order belongs to the seller
-        cursor.execute("SELECT phone FROM users WHERE id = %s", (user['user_id'],))
-        seller_phone = cursor.fetchone()['phone']
-        
-        cursor.execute("SELECT id, status, total_amount, buyer_id FROM orders WHERE id = %s AND seller_phone = %s", (order_id, seller_phone))
-        order = cursor.fetchone()
-        
-        if not order:
-            raise HTTPException(status_code=404, detail="Order not found or access denied")
-            
-        # 2. Update Status
-        cursor.execute("UPDATE orders SET status = %s WHERE id = %s", (update.status, order_id))
-        if update.status == 'COMPLETED':
+        # 4. Create Order Items (PERMANENT FIX: using unit_price)
+        for item in items:
             cursor.execute("""
-                UPDATE wallets 
-                SET balance_pending = balance_pending - %s, 
-                    balance_available = balance_available + %s 
-                WHERE user_id = %s
-            """, (order['total_amount'], order['total_amount'], user['user_id']))
+                INSERT INTO order_items (order_id, listing_id, quantity, unit_price, seller_phone)
+                VALUES (%s, %s, %s, %s, %s)
+            """, (order_id, item['listing_id'], item['quantity'], item['price'], item['seller_phone']))
+
+        # 5. Clear Cart
+        cursor.execute("DELETE FROM cart_items WHERE user_id = %s", (user['user_id'],))
+        
+        # 6. Payment Routing
+        payment_info = {}
+        if req.payment_method == 'MPESA':
+            mpesa = MpesaService()
+            res = mpesa.stk_push(req.mpesa_phone, int(total), order_id)
+            if "ResponseCode" in res and res["ResponseCode"] == "0":
+                trx_id = str(uuid.uuid4())
+                cursor.execute("""
+                    INSERT INTO transactions (id, order_id, amount, type, status, checkout_request_id, phone_number)
+                    VALUES (%s, %s, %s, 'ESCROW_DEPOSIT', 'PROCESSING', %s, %s)
+                """, (trx_id, order_id, total, res['CheckoutRequestID'], req.mpesa_phone))
+                payment_info = {"type": "MPESA", "message": "STK Push sent to your phone. Please enter your PIN to secure the funds in Escrow."}
+            else:
+                payment_info = {"type": "ERROR", "message": res.get('errorMessage', "Failed to trigger M-Pesa. Order saved as Pending.")}
+
+        elif req.payment_method == 'BANK':
+            payment_info = {
+                "type": "BANK",
+                "message": "Please transfer funds to the DAGIV Escrow Account below.",
+                "bank": "Equity Bank Kenya",
+                "account_name": "DAGIV Escrow Trust",
+                "account_number": "012345678910",
+                "branch": "Industrial Area",
+                "reference": order_id
+            }
             
+        elif req.payment_method == 'CARD':
+            payment_info = {
+                "type": "CARD",
+                "message": "Redirecting to secure card gateway...",
+                "url": f"https://sandbox.pesapal.com/pay/{order_id}" # Mock URL
+            }
+
         conn.commit()
+        background_tasks.add_task(send_email_alert, "New Order via Checkout", f"Order ID: {order_id}\nTotal: KES {total}\nMethod: {req.payment_method}")
+        return {"status": "success", "order_id": order_id, "payment_info": payment_info}
         
-        # 4. Notify
-        background_tasks.add_task(send_email_alert, f"Order {update.status}", f"Order {order_id} marked as {update.status} by Seller.")
-        
-        return {"status": "success", "new_state": update.status}
     except Exception as e:
         conn.rollback()
+        print(f"Checkout Error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
     finally:
         conn.close()
 
-# --- MARKETPLACE LISTING FETCH (CRITICAL ADDITION) ---
+@app.post("/api/test/mock-payment-success/{order_id}")
+def mock_payment_success(order_id: str):
+    """Developer endpoint to simulate Safaricom confirming the STK push"""
+    conn = get_db_connection()
+    cursor = conn.cursor(cursor_factory=RealDictCursor)
+    try:
+        # Update order to FUNDS_SECURED
+        cursor.execute("UPDATE orders SET status = 'FUNDS_SECURED' WHERE id = %s RETURNING id", (order_id,))
+        if not cursor.fetchone(): raise HTTPException(status_code=404, detail="Order not found")
+        
+        # Credit the pending balance of the sellers involved
+        cursor.execute("SELECT seller_phone, unit_price, quantity FROM order_items WHERE order_id = %s", (order_id,))
+        items = cursor.fetchall()
+        for item in items:
+            item_total = item['unit_price'] * item['quantity']
+            # Find seller's user_id
+            cursor.execute("SELECT id FROM users WHERE phone = %s", (item['seller_phone'],))
+            seller = cursor.fetchone()
+            if seller:
+                cursor.execute("UPDATE wallets SET balance_pending = balance_pending + %s WHERE user_id = %s", (item_total, seller['id']))
+        
+        cursor.execute("UPDATE transactions SET status = 'COMPLETED' WHERE order_id = %s", (order_id,))
+        conn.commit()
+        return {"status": "success", "message": f"Order {order_id} is now FUNDS_SECURED. Seller sees funds as pending."}
+    finally: conn.close()
+
+@app.post("/api/orders/{order_id}/release-escrow")
+def release_escrow(order_id: str, user: dict = Depends(get_current_user)):
+    """Buyer endpoint to confirm receipt and release funds to the seller"""
+    conn = get_db_connection()
+    cursor = conn.cursor(cursor_factory=RealDictCursor)
+    try:
+        cursor.execute("SELECT status FROM orders WHERE id = %s AND buyer_id = %s", (order_id, user['user_id']))
+        order = cursor.fetchone()
+        if not order: raise HTTPException(status_code=404, detail="Order not found")
+        if order['status'] != 'FUNDS_SECURED' and order['status'] != 'IN_TRANSIT':
+            raise HTTPException(status_code=400, detail="Order is not in a releasable state")
+
+        # Update order status
+        cursor.execute("UPDATE orders SET status = 'RELEASED' WHERE id = %s", (order_id,))
+        
+        # Move pending funds to available funds for the seller
+        cursor.execute("SELECT seller_phone, unit_price, quantity FROM order_items WHERE order_id = %s", (order_id,))
+        items = cursor.fetchall()
+        for item in items:
+            item_total = item['unit_price'] * item['quantity']
+            cursor.execute("SELECT id FROM users WHERE phone = %s", (item['seller_phone'],))
+            seller = cursor.fetchone()
+            if seller:
+                cursor.execute("""
+                    UPDATE wallets 
+                    SET balance_pending = balance_pending - %s, balance_available = balance_available + %s 
+                    WHERE user_id = %s
+                """, (item_total, item_total, seller['id']))
+                
+        conn.commit()
+        return {"status": "success", "message": "Funds have been released to the seller."}
+    finally: conn.close()
+
 @app.get("/api/marketplace/listings")
 def get_public_listings():
     conn = get_db_connection()
     cursor = conn.cursor(cursor_factory=RealDictCursor)
     try:
-        # Fetch only ACTIVE listings
         cursor.execute("""
             SELECT 
                 id, 
@@ -985,7 +1103,6 @@ def get_public_listings():
         """)
         listings = cursor.fetchall()
         
-        # Parse JSON specs
         for item in listings:
             if isinstance(item['specs'], str):
                 import json
@@ -1000,39 +1117,9 @@ def get_public_listings():
 
         return listings
     except Exception as e:
-        print(f"Market Fetch Error: {e}")
         return []
     finally:
         conn.close()
-
-# --- NEW PAYMENT ENDPOINT ---
-@app.post("/api/payments/mpesa/pay")
-def trigger_mpesa_payment(req: MpesaPaymentRequest, background_tasks: BackgroundTasks):
-    mpesa = MpesaService()
-    
-    # 1. Trigger STK Push
-    # Note: Amount must be INT for M-Pesa
-    response = mpesa.stk_push(req.phone_number, int(req.amount), req.order_id)
-    
-    if "ResponseCode" in response and response["ResponseCode"] == "0":
-        # 2. Log Transaction state
-        conn = get_db_connection()
-        cursor = conn.cursor()
-        
-        # FIX: Generate true UUID for transaction ID
-        trx_id = str(uuid.uuid4())
-        
-        cursor.execute("""
-            INSERT INTO transactions (id, order_id, amount, type, status, checkout_request_id, phone_number)
-            VALUES (%s, %s, %s, 'PAYMENT_INITIATED', 'PROCESSING', %s, %s)
-        """, (trx_id, req.order_id, req.amount, response['CheckoutRequestID'], req.phone_number))
-        
-        conn.commit()
-        conn.close()
-        
-        return {"status": "success", "message": "STK Push Sent", "checkoutRequestId": response['CheckoutRequestID']}
-    else:
-        return {"status": "error", "detail": response.get("errorMessage", "Failed to initiate M-Pesa")}
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8000)
