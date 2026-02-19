@@ -271,7 +271,7 @@ def startup_db():
             buyer_id TEXT,
             seller_phone TEXT,
             listing_id TEXT,
-            amount REAL,
+            total_amount REAL, 
             currency TEXT,
             status TEXT DEFAULT 'PENDING_PAYMENT',
             payment_method TEXT,
@@ -279,7 +279,8 @@ def startup_db():
         )
     """)
     
-    # 2. Transactions Table (Updated for M-Pesa)
+    # 2. Transactions Table
+    # FIX: We use TEXT for id since some databases strictly enforce UUID formats.
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS transactions (
             id TEXT PRIMARY KEY,
@@ -294,20 +295,31 @@ def startup_db():
         )
     """)
     
-    # 3. Migration: Add columns if they don't exist
+    # 3. Migration: Force add ALL new columns if they are missing
     try:
-        # Ensure order listing_id exists
+        # Update orders table
         cursor.execute("ALTER TABLE orders ADD COLUMN IF NOT EXISTS listing_id TEXT")
+        cursor.execute("ALTER TABLE orders ADD COLUMN IF NOT EXISTS seller_phone TEXT")
+        cursor.execute("ALTER TABLE orders ADD COLUMN IF NOT EXISTS total_amount REAL") 
+        cursor.execute("ALTER TABLE orders ADD COLUMN IF NOT EXISTS currency TEXT")
+        cursor.execute("ALTER TABLE orders ADD COLUMN IF NOT EXISTS payment_method TEXT")
         
-        # Ensure new M-Pesa transaction columns exist
+        # Update transactions table
+        cursor.execute("ALTER TABLE transactions ADD COLUMN IF NOT EXISTS type TEXT")           
+        # FIX FOR ENUM ERROR: Force 'type' and 'status' columns to be standard TEXT
+        cursor.execute("ALTER TABLE transactions ALTER COLUMN type TYPE TEXT USING type::text")
+        
+        cursor.execute("ALTER TABLE transactions ADD COLUMN IF NOT EXISTS status TEXT DEFAULT 'PENDING'") 
+        cursor.execute("ALTER TABLE transactions ALTER COLUMN status TYPE TEXT USING status::text")
+        
         cursor.execute("ALTER TABLE transactions ADD COLUMN IF NOT EXISTS checkout_request_id TEXT")
         cursor.execute("ALTER TABLE transactions ADD COLUMN IF NOT EXISTS mpesa_receipt TEXT")
         cursor.execute("ALTER TABLE transactions ADD COLUMN IF NOT EXISTS phone_number TEXT")
         
         conn.commit()
-        print("✅ Database Migration: Checked/Added columns.")
+        print("✅ Database Migration: Converted ENUM to TEXT and added missing columns to schema.")
     except Exception as e:
-        print(f"⚠️ Migration warning: {e}")
+        print(f"⚠️ Migration warning (Safe to ignore if columns already exist/converted): {e}")
         conn.rollback()
         
     conn.commit()
@@ -850,12 +862,12 @@ def create_order(order: OrderCreate, background_tasks: BackgroundTasks, user: di
         
         # 4. Save Order
         cursor.execute("""
-            INSERT INTO orders (id, buyer_id, seller_phone, listing_id, amount, currency, status, payment_method)
+            INSERT INTO orders (id, buyer_id, seller_phone, listing_id, total_amount, currency, status, payment_method)
             VALUES (%s, %s, %s, %s, %s, %s, 'PENDING_PAYMENT', %s)
         """, (order_id, user['user_id'], listing['phone'], order.listing_id, total, listing['currency'], order.payment_method))
         
         # 5. Log Transaction (Ledger)
-        trans_id = f"TRX-{uuid.uuid4().hex[:8].upper()}"
+        trans_id = str(uuid.uuid4())
         cursor.execute("""
             INSERT INTO transactions (id, order_id, amount, type, status)
             VALUES (%s, %s, %s, 'ESCROW_DEPOSIT', 'PENDING')
@@ -889,7 +901,7 @@ def get_seller_orders(user: dict = Depends(require_role("SELLER"))):
         # Fetch Orders where this user is the seller
         cursor.execute("""
             SELECT 
-                o.id, o.amount, o.currency, o.status, o.created_at,
+                o.id, o.total_amount as amount, o.currency, o.status, o.created_at,
                 o.payment_method, u.email as buyer_contact,
                 l.brand, l.model, l.listing_type
             FROM orders o
@@ -916,7 +928,7 @@ def update_order_status(order_id: str, update: OrderStatusUpdate, background_tas
         cursor.execute("SELECT phone FROM users WHERE id = %s", (user['user_id'],))
         seller_phone = cursor.fetchone()['phone']
         
-        cursor.execute("SELECT id, status, amount, buyer_id FROM orders WHERE id = %s AND seller_phone = %s", (order_id, seller_phone))
+        cursor.execute("SELECT id, status, total_amount, buyer_id FROM orders WHERE id = %s AND seller_phone = %s", (order_id, seller_phone))
         order = cursor.fetchone()
         
         if not order:
@@ -930,7 +942,7 @@ def update_order_status(order_id: str, update: OrderStatusUpdate, background_tas
                 SET balance_pending = balance_pending - %s, 
                     balance_available = balance_available + %s 
                 WHERE user_id = %s
-            """, (order['amount'], order['amount'], user['user_id']))
+            """, (order['total_amount'], order['total_amount'], user['user_id']))
             
         conn.commit()
         
@@ -1006,7 +1018,9 @@ def trigger_mpesa_payment(req: MpesaPaymentRequest, background_tasks: Background
         # 2. Log Transaction state
         conn = get_db_connection()
         cursor = conn.cursor()
-        trx_id = f"TRX-{uuid.uuid4().hex[:8].upper()}"
+        
+        # FIX: Generate true UUID for transaction ID
+        trx_id = str(uuid.uuid4())
         
         cursor.execute("""
             INSERT INTO transactions (id, order_id, amount, type, status, checkout_request_id, phone_number)
