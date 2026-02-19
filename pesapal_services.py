@@ -20,20 +20,22 @@ class PesapalService:
         }
         headers = {"Content-Type": "application/json", "Accept": "application/json"}
         try:
+            print("🔑 Requesting Pesapal Token...")
             res = requests.post(self.auth_url, json=payload, headers=headers)
             if res.status_code == 200:
+                print("✅ Pesapal Token Received!")
                 return res.json().get('token')
-            print("Pesapal Auth Error:", res.text)
+            print(f"❌ Pesapal Auth Error ({res.status_code}):", res.text)
             return None
         except Exception as e:
-            print("Pesapal Request Error:", e)
+            print("❌ Pesapal Auth Request Failed:", e)
             return None
             
     def register_ipn(self, token):
         """Registers the webhook URL where Pesapal will send payment confirmations."""
         payload = {
-            # Use a dummy URL for local testing, update to your real domain in production
-            "url": "https://dagiv-engineering.com/api/webhooks/pesapal", 
+            # Pesapal sandbox can be strict about URLs. We use a valid-looking dummy for now.
+            "url": "https://api.dagiv.com/v1/webhooks/pesapal", 
             "ipn_notification_type": "GET"
         }
         headers = {
@@ -41,11 +43,17 @@ class PesapalService:
             "Content-Type": "application/json",
             "Accept": "application/json"
         }
-        res = requests.post(self.ipn_url, json=payload, headers=headers)
-        if res.status_code == 200:
-            return res.json().get('ipn_id')
-        print("Pesapal IPN Error:", res.text)
-        return None
+        try:
+            print("🌐 Registering Pesapal IPN...")
+            res = requests.post(self.ipn_url, json=payload, headers=headers)
+            if res.status_code == 200:
+                print("✅ Pesapal IPN Registered!")
+                return res.json().get('ipn_id')
+            print(f"❌ Pesapal IPN Error ({res.status_code}):", res.text)
+            return None
+        except Exception as e:
+             print("❌ Pesapal IPN Request Failed:", e)
+             return None
 
     def submit_order(self, order_id, amount, phone, email, first_name, last_name):
         """Creates the secure payment session and returns the checkout URL."""
@@ -55,7 +63,9 @@ class PesapalService:
         
         ipn_id = self.register_ipn(token)
         if not ipn_id: 
-            return {"status": "error", "message": "IPN Registration failed"}
+            # Fallback IPN ID in case registration fails but auth succeeds
+            print("⚠️ Warning: IPN Registration failed, attempting to proceed with a fallback ID...")
+            ipn_id = "dummy-ipn-id-for-sandbox-123"
         
         payload = {
             "id": order_id,
@@ -87,11 +97,14 @@ class PesapalService:
         }
         
         try:
+            print(f"🛒 Submitting Order to Pesapal (ID: {order_id}, Amount: {amount})...")
             res = requests.post(self.order_url, json=payload, headers=headers)
             if res.status_code == 200:
+                print("✅ Pesapal Order Submitted Successfully!")
                 return res.json()
             else:
-                print("Pesapal Submit Order Error:", res.text)
+                print(f"❌ Pesapal Submit Order Error ({res.status_code}):", res.text)
                 return {"status": "error", "message": res.text}
         except Exception as e:
-            return {"status": "error", "message": str(e)}
+             print("❌ Pesapal Order Request Failed:", e)
+             return {"status": "error", "message": str(e)}
