@@ -3,11 +3,14 @@ import base64
 from datetime import datetime
 import json
 import os
+
 CONSUMER_KEY = os.getenv("MPESA_KEY", "M3Gi1qewRHJLR9o3uXxEViJ6TaVqNmAhYtSy0WF6GG7ayaBC") 
 CONSUMER_SECRET = os.getenv("MPESA_SECRET", "AhIC9ItGvAv6ft51HlfQmBuawMECJLJN2sPdxAzwTj883G5MSfDzBRSZEekuAGBb") 
 PASSKEY = os.getenv("MPESA_PASSKEY", "bfb279f9aa9bdbcf158e97dd71a467cd2e0c893059b10f78e6b72ada1ed2c919")
 BUSINESS_SHORTCODE = "174379" # Sandbox Paybill
-CALLBACK_URL = "https://your-domain.com/api/payments/mpesa/callback" # Must be HTTPS and public
+
+# FIXED: Removed the space and added the exact webhook path
+CALLBACK_URL = "https://conchoidal-debora-nontroubling.ngrok-free.dev/api/payments/mpesa/callback"
 
 class MpesaService:
     def __init__(self):

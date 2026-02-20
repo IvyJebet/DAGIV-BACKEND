@@ -6,7 +6,7 @@ import ssl
 import uuid
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
-from fastapi import FastAPI, HTTPException, Depends, status, BackgroundTasks
+from fastapi import FastAPI, HTTPException, Depends, Request, status, BackgroundTasks
 from fastapi.security import OAuth2PasswordBearer
 from pydantic import BaseModel
 from fastapi.middleware.cors import CORSMiddleware
@@ -1083,6 +1083,98 @@ def release_escrow(order_id: str, user: dict = Depends(get_current_user)):
         conn.commit()
         return {"status": "success", "message": "Funds have been released to the seller."}
     finally: conn.close()
+
+@app.post("/api/payments/mpesa/callback")
+async def mpesa_callback(request: Request, background_tasks: BackgroundTasks):
+    """Listens for Daraja STK Push completion."""
+    try:
+        data = await request.json()
+        print("📥 Incoming M-Pesa Webhook:", json.dumps(data, indent=2))
+        
+        callback_data = data.get("Body", {}).get("stkCallback", {})
+        result_code = callback_data.get("ResultCode")
+        checkout_request_id = callback_data.get("CheckoutRequestID")
+
+        if result_code == 0:
+            # Payment Successful!
+            conn = get_db_connection()
+            cursor = conn.cursor(cursor_factory=RealDictCursor)
+            
+            # Find the transaction
+            cursor.execute("SELECT order_id FROM transactions WHERE checkout_request_id = %s", (checkout_request_id,))
+            txn = cursor.fetchone()
+            
+            if txn:
+                order_id = txn['order_id']
+                # 1. Update Order Status
+                cursor.execute("UPDATE orders SET status = 'FUNDS_SECURED' WHERE id = %s", (order_id,))
+                # 2. Update Transaction Status
+                cursor.execute("UPDATE transactions SET status = 'COMPLETED' WHERE checkout_request_id = %s", (checkout_request_id,))
+                
+                # 3. Credit Seller's Pending Wallet
+                cursor.execute("SELECT seller_phone, unit_price, quantity FROM order_line_items WHERE order_id = %s", (order_id,))
+                items = cursor.fetchall()
+                for item in items:
+                    item_total = item['unit_price'] * item['quantity']
+                    cursor.execute("SELECT id FROM users WHERE phone = %s", (item['seller_phone'],))
+                    seller = cursor.fetchone()
+                    if seller:
+                        cursor.execute("UPDATE wallets SET balance_pending = balance_pending + %s WHERE user_id = %s", (item_total, seller['id']))
+                
+                conn.commit()
+                background_tasks.add_task(send_email_alert, "Escrow Secured (M-Pesa)", f"Order {order_id} has been fully funded via M-Pesa.")
+            conn.close()
+
+        return {"ResultCode": 0, "ResultDesc": "Accepted"}
+    except Exception as e:
+        print("❌ M-Pesa Webhook Error:", e)
+        return {"ResultCode": 1, "ResultDesc": "Rejected"}
+
+
+@app.get("/api/webhooks/pesapal")
+async def pesapal_webhook(OrderTrackingId: str, OrderNotificationType: str, OrderMerchantReference: str, background_tasks: BackgroundTasks):
+    """Listens for Pesapal Card Payment completion."""
+    try:
+        print(f"📥 Incoming Pesapal Webhook: {OrderTrackingId}")
+        
+        pesapal = PesapalService()
+        status_data = pesapal.get_transaction_status(OrderTrackingId)
+        
+        if status_data and status_data.get("payment_status_description") == "Completed":
+            order_id = OrderMerchantReference
+            
+            conn = get_db_connection()
+            cursor = conn.cursor(cursor_factory=RealDictCursor)
+            
+            # 1. Update Order Status
+            cursor.execute("UPDATE orders SET status = 'FUNDS_SECURED' WHERE id = %s", (order_id,))
+            # 2. Update Transaction Status
+            cursor.execute("UPDATE transactions SET status = 'COMPLETED' WHERE order_id = %s", (order_id,))
+            
+            # 3. Credit Seller's Pending Wallet
+            cursor.execute("SELECT seller_phone, unit_price, quantity FROM order_line_items WHERE order_id = %s", (order_id,))
+            items = cursor.fetchall()
+            for item in items:
+                item_total = item['unit_price'] * item['quantity']
+                cursor.execute("SELECT id FROM users WHERE phone = %s", (item['seller_phone'],))
+                seller = cursor.fetchone()
+                if seller:
+                    cursor.execute("UPDATE wallets SET balance_pending = balance_pending + %s WHERE user_id = %s", (item_total, seller['id']))
+            
+            conn.commit()
+            conn.close()
+            background_tasks.add_task(send_email_alert, "Escrow Secured (Card)", f"Order {order_id} has been fully funded via Pesapal.")
+
+        # Pesapal expects a response detailing what we received to acknowledge it
+        return {
+            "orderNotificationType": OrderNotificationType,
+            "orderTrackingId": OrderTrackingId,
+            "orderMerchantReference": OrderMerchantReference,
+            "status": 200
+        }
+    except Exception as e:
+        print("❌ Pesapal Webhook Error:", e)
+        return {"status": 500}
 
 @app.get("/api/marketplace/listings")
 def get_public_listings():
