@@ -1,10 +1,8 @@
 import requests
 import os
-
-# --- PESAPAL V3 CONFIGURATION (SANDBOX) ---
 PESAPAL_CONSUMER_KEY = os.getenv("PESAPAL_KEY", "18ltrhhMAuNdqFWrrql6QKVyd5MGhCUX")
 PESAPAL_CONSUMER_SECRET = os.getenv("PESAPAL_SECRET", "fW3mH0UjH2VFjI0HqwQemnH6OOs=")
-PESAPAL_BASE_URL = "https://cybqa.pesapal.com/pesapalv3"
+PESAPAL_BASE_URL = "https://pay.pesapal.com/v3"
 
 class PesapalService:
     def __init__(self):
@@ -22,9 +20,19 @@ class PesapalService:
         try:
             print("🔑 Requesting Pesapal Token...")
             res = requests.post(self.auth_url, json=payload, headers=headers)
+            
             if res.status_code == 200:
-                print("✅ Pesapal Token Received!")
-                return res.json().get('token')
+                data = res.json()
+                token = data.get('token')
+                
+                # 🛑 FIX: Ensure the token actually exists and isn't empty
+                if token:
+                    print("✅ Pesapal Token Received Successfully!")
+                    return token
+                else:
+                    print(f"❌ Pesapal API returned 200, but NO TOKEN was found! Raw Response: {res.text}")
+                    return None
+                    
             print(f"❌ Pesapal Auth Error ({res.status_code}):", res.text)
             return None
         except Exception as e:
@@ -34,8 +42,7 @@ class PesapalService:
     def register_ipn(self, token):
         """Registers the webhook URL where Pesapal will send payment confirmations."""
         payload = {
-            # Pesapal sandbox can be strict about URLs. We use a valid-looking dummy for now.
-            "url": "https://api.dagiv.com/v1/webhooks/pesapal", 
+            "url": "https://httpstat.us/200", 
             "ipn_notification_type": "GET"
         }
         headers = {
@@ -99,8 +106,10 @@ class PesapalService:
         try:
             print(f"🛒 Submitting Order to Pesapal (ID: {order_id}, Amount: {amount})...")
             res = requests.post(self.order_url, json=payload, headers=headers)
+            
             if res.status_code == 200:
-                print("✅ Pesapal Order Submitted Successfully!")
+                # 🛑 FIX: Print the exact response from Pesapal so we can read the error
+                print(f"✅ Pesapal Network 200 OK. RAW RESPONSE: {res.text}")
                 return res.json()
             else:
                 print(f"❌ Pesapal Submit Order Error ({res.status_code}):", res.text)

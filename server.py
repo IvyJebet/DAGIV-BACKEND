@@ -946,7 +946,7 @@ def process_checkout(req: CheckoutProcessRequest, background_tasks: BackgroundTa
 
         # 2. Calculate Total
         subtotal = sum(i['price'] * i['quantity'] for i in items)
-        shipping_cost = 15000.0 # Standard flat rate heavy haulage
+        shipping_cost = 0.0 # Standard flat rate heavy haulage
         total = subtotal + shipping_cost
 
         # 3. Create Main Order
@@ -1001,26 +1001,26 @@ def process_checkout(req: CheckoutProcessRequest, background_tasks: BackgroundTa
             phone = req.shipping_details.get('phone', '0700000000')
             first_name = req.shipping_details.get('firstName', 'Guest')
             last_name = req.shipping_details.get('lastName', 'User')
-            
-            # Submit to Pesapal
             res = pesapal.submit_order(order_id, total, phone, email, first_name, last_name)
             
             if res and "redirect_url" in res:
                 payment_info = {
                     "type": "CARD",
                     "message": "Secure gateway initialized.",
-                    "url": res["redirect_url"] # The real, secure PCI-compliant URL
+                    "url": res["redirect_url"]
                 }
             else:
-                payment_info = {
-                    "type": "ERROR",
-                    "message": "Failed to initialize Pesapal gateway. " + str(res.get('message', ''))
-                }
-
+                error_msg = res.get('message', 'Unknown Error') if isinstance(res, dict) else 'Check IPN URL'
+                raise HTTPException(
+                    status_code=400, 
+                    detail=f"Failed to initialize Pesapal gateway: {error_msg}"
+                )
         conn.commit()
         background_tasks.add_task(send_email_alert, "New Order via Checkout", f"Order ID: {order_id}\nTotal: KES {total}\nMethod: {req.payment_method}")
         return {"status": "success", "order_id": order_id, "payment_info": payment_info}
         
+    except HTTPException as he:
+        raise he 
     except Exception as e:
         conn.rollback()
         print(f"Checkout Error: {e}")
@@ -1034,11 +1034,8 @@ def mock_payment_success(order_id: str):
     conn = get_db_connection()
     cursor = conn.cursor(cursor_factory=RealDictCursor)
     try:
-        # Update order to FUNDS_SECURED
         cursor.execute("UPDATE orders SET status = 'FUNDS_SECURED' WHERE id = %s RETURNING id", (order_id,))
         if not cursor.fetchone(): raise HTTPException(status_code=404, detail="Order not found")
-        
-        # Credit the pending balance of the sellers involved (FIXED: using order_line_items)
         cursor.execute("SELECT seller_phone, unit_price, quantity FROM order_line_items WHERE order_id = %s", (order_id,))
         items = cursor.fetchall()
         for item in items:
