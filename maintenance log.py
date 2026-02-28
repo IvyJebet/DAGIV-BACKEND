@@ -13,9 +13,11 @@ import random
 import string
 import threading
 import queue
+from dotenv import load_dotenv
+load_dotenv()
 
 # --- CONFIGURATION ---
-DATABASE_URL = "postgresql://postgres.fzmydgefyoaglnroenae:IvyEngineering2026@aws-1-eu-west-2.pooler.supabase.com:6543/postgres?sslmode=require"
+DATABASE_URL = os.getenv("DATABASE_URL")
 
 # --- 1. SMART IMPORTS ---
 try:

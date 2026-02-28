@@ -526,7 +526,20 @@ def startup_db():
     except Exception as e:
         print(f"Migration Info: {e}")
         conn.rollback()
-        
+    try:
+        cursor.execute("SELECT id FROM users WHERE username = 'admin'")
+        if not cursor.fetchone():
+            admin_id = str(uuid.uuid4())
+            admin_pass = hash_text("admin")
+            cursor.execute("""
+                INSERT INTO users (id, username, password_hash, role, email, phone, is_verified, security_question, security_answer_hash)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+            """, (admin_id, "admin", admin_pass, "admin", "admin@dagiv.co.ke", "0700000000", True, "Default", admin_pass))
+            conn.commit()
+            print("✅ Default Admin account created for Desktop App.")
+    except Exception as e:
+        print(f"Admin Creation Info: {e}")
+        conn.rollback()
     conn.commit()
     conn.close()
 
