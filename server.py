@@ -16,6 +16,7 @@ from fastapi import FastAPI, HTTPException, Depends, Request, status, Background
 from fastapi.security import OAuth2PasswordBearer
 from pydantic import BaseModel
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 from jose import JWTError, jwt
 import uvicorn
 from google import genai
@@ -29,6 +30,11 @@ from dotenv import load_dotenv
 import os
 from mpesa_services import MpesaService
 from pesapal_services import PesapalService
+from io import BytesIO
+from reportlab.pdfgen import canvas
+from reportlab.lib.pagesizes import letter
+from reportlab.lib.units import inch
+from reportlab.lib import colors
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("dagiv_celery")
@@ -819,6 +825,166 @@ def remove_from_cart(listing_id: str, user: dict = Depends(get_current_user)):
     finally:
         conn.close()
 
+@app.get("/api/buyer/orders")
+def get_buyer_orders(user: dict = Depends(get_current_user)):
+    """Fetches all orders for the logged-in buyer to populate the dashboard pipeline"""
+    conn = get_db_connection()
+    cursor = conn.cursor(cursor_factory=RealDictCursor)
+    try:
+        cursor.execute("""
+            SELECT id, total_amount as total, currency, status, created_at as date, shipping_details
+            FROM orders 
+            WHERE buyer_id = %s 
+            ORDER BY created_at DESC
+        """, (user['user_id'],))
+        db_orders = cursor.fetchall()
+
+        result = []
+        for order in db_orders:
+            shipping = {"address": "N/A", "city": "N/A"}
+            if order['shipping_details']:
+                if isinstance(order['shipping_details'], str):
+                    try:
+                        parsed_ship = json.loads(order['shipping_details'])
+                        shipping = {
+                            "address": parsed_ship.get("address", "N/A"),
+                            "city": parsed_ship.get("city", "N/A")
+                        }
+                    except: pass
+                else:
+                    shipping = {
+                        "address": order['shipping_details'].get("address", "N/A"),
+                        "city": order['shipping_details'].get("city", "N/A")
+                    }
+            cursor.execute("""
+                SELECT li.listing_id as id, li.quantity, li.unit_price as price, 
+                       m.brand, m.model, m.specs, m.category, m.listing_type
+                FROM order_line_items li
+                JOIN marketplace_listings m ON li.listing_id = m.id
+                WHERE li.order_id = %s
+            """, (order['id'],))
+            db_items = cursor.fetchall()
+
+            items = []
+            for item in db_items:
+                image = "https://via.placeholder.com/300?text=No+Image"
+                if item['specs']:
+                    specs = item['specs'] if isinstance(item['specs'], dict) else json.loads(item['specs'])
+                    if 'images' in specs and len(specs['images']) > 0:
+                        image = specs['images'][0]
+                
+                items.append({
+                    "id": item['id'],
+                    "brand": item['brand'],
+                    "model": item['model'],
+                    "image": image,
+                    "quantity": item['quantity'],
+                    "price": item['price'],
+                    "category": item['category'] or "Heavy Equipment",
+                    "listing_type": item['listing_type'] or "SALE"
+                })
+
+            result.append({
+                "id": order['id'],
+                "date": order['date'].isoformat() if isinstance(order['date'], datetime) else order['date'],
+                "total": order['total'],
+                "currency": order['currency'],
+                "status": order['status'],
+                "items": items,
+                "shipping": shipping
+            })
+        
+        return result
+    except Exception as e:
+        print(f"Error fetching orders: {e}")
+        raise HTTPException(status_code=500, detail="Failed to fetch orders")
+    finally:
+        conn.close()
+
+@app.get("/api/orders/{order_id}/invoice")
+def generate_invoice(order_id: str, user: dict = Depends(get_current_user)):
+    """Dynamically generates a PDF commercial invoice using ReportLab"""
+    conn = get_db_connection()
+    cursor = conn.cursor(cursor_factory=RealDictCursor)
+    try:
+        # 1. Verify ownership and fetch order
+        cursor.execute("SELECT * FROM orders WHERE id = %s AND buyer_id = %s", (order_id, user['user_id']))
+        order = cursor.fetchone()
+        if not order:
+            raise HTTPException(status_code=404, detail="Order not found")
+
+        # 2. Fetch Line Items
+        cursor.execute("""
+            SELECT li.quantity, li.unit_price, m.brand, m.model
+            FROM order_line_items li
+            JOIN marketplace_listings m ON li.listing_id = m.id
+            WHERE li.order_id = %s
+        """, (order_id,))
+        items = cursor.fetchall()
+
+        buffer = BytesIO()
+        p = canvas.Canvas(buffer, pagesize=letter)
+        width, height = letter
+        p.setFont("Helvetica-Bold", 24)
+        p.setFillColor(colors.HexColor("#eab308")) # DAGIV Yellow
+        p.drawString(50, height - 50, "DAGIV ENGINEERING")
+        
+        p.setFont("Helvetica", 10)
+        p.setFillColor(colors.gray)
+        p.drawString(50, height - 65, "Industrial Area, Enterprise Rd, Nairobi, Kenya | dagivengineeering@gmail.com | Payment Verified")
+        p.setFont("Helvetica-Bold", 14)
+        p.setFillColor(colors.black)
+        p.drawString(50, height - 100, "COMMERCIAL INVOICE")
+        
+        p.setFont("Helvetica", 10)
+        p.drawString(50, height - 120, f"Order ID: {order['id']}")
+        p.drawString(50, height - 135, f"Date: {order['created_at'].strftime('%Y-%m-%d')}")
+        p.drawString(50, height - 150, f"Payment Method: {order['payment_method']}")
+        y = height - 200
+        p.setFont("Helvetica-Bold", 10)
+        p.setFillColor(colors.HexColor("#0f172a")) # Slate-900
+        p.rect(50, y-5, width-100, 20, fill=1)
+        p.setFillColor(colors.white)
+        p.drawString(60, y, "Description")
+        p.drawString(300, y, "Qty")
+        p.drawString(380, y, "Unit Price")
+        p.drawString(480, y, "Total")
+        y -= 25
+        p.setFont("Helvetica", 10)
+        p.setFillColor(colors.black)
+        for item in items:
+            desc = f"{item['brand']} {item['model']}"
+            qty = str(item['quantity'])
+            u_price = f"{order['currency']} {item['unit_price']:,.2f}"
+            item_tot = f"{order['currency']} {(item['unit_price'] * item['quantity']):,.2f}"
+            
+            p.drawString(60, y, desc[:35])
+            p.drawString(300, y, qty)
+            p.drawString(380, y, u_price)
+            p.drawString(480, y, item_tot)
+            y -= 20
+            y -= 20
+            p.line(50, y+10, width-50, y+10)
+            p.setFont("Helvetica-Bold", 12)
+            p.drawString(380, y-10, "Total Paid:")
+            p.setFillColor(colors.HexColor("#eab308"))
+            p.drawString(480, y-10, f"{order['currency']} {order['total_amount']:,.2f}")
+            p.setFont("Helvetica-Oblique", 9)
+            p.setFillColor(colors.gray)
+            p.drawString(50, 50, "Thank you for trusting DAGIV Engineering, the world's trusted mechanical partner!")
+            p.save()
+            buffer.seek(0)
+        return StreamingResponse(
+            buffer, 
+            media_type="application/pdf", 
+            headers={"Content-Disposition": f"attachment; filename=DAGIV_Invoice_{order_id}.pdf"}
+        )
+
+    except Exception as e:
+        print(f"PDF Gen Error: {e}")
+        raise HTTPException(status_code=500, detail="Failed to generate invoice")
+    finally:
+        conn.close()
 @app.post("/api/ai-consultant")
 def ask_ai_engineer(req: AIChatRequest):
     if not ai_client:
@@ -1188,7 +1354,8 @@ def process_checkout(req: CheckoutProcessRequest, background_tasks: BackgroundTa
 
         subtotal = sum(i['price'] * i['quantity'] for i in items)
         shipping_cost = 0.0 
-        total = subtotal + shipping_cost
+        escrow_fee = subtotal * 0.015 # Calculate 1.5% Escrow Fee
+        total = subtotal + shipping_cost + escrow_fee # Final charged amount
 
         order_id = f"ORD-{uuid.uuid4().hex[:8].upper()}"
         cursor.execute("""
@@ -1385,6 +1552,38 @@ def track_shipment(tracking_number: str):
     info = LOGISTICS_DB.get(tracking_number)
     if not info: raise HTTPException(status_code=404, detail="Tracking number not found")
     return info
+
+@app.post("/api/orders/{order_id}/simulate-flow")
+def simulate_order_flow(order_id: str, background_tasks: BackgroundTasks):
+    """
+    Developer Tool: Advances the order status by one step so you can test the UI.
+    Does not require authentication.
+    """
+    stages = ['PENDING_PAYMENT', 'FUNDS_SECURED', 'INSPECTION_SCHEDULED', 'DISPATCHED', 'IN_TRANSIT', 'DELIVERED', 'RELEASED']
+    conn = get_db_connection()
+    cursor = conn.cursor(cursor_factory=RealDictCursor)
+    try:
+        cursor.execute("SELECT status FROM orders WHERE id = %s", (order_id,))
+        order = cursor.fetchone()
+        if not order: raise HTTPException(status_code=404, detail="Order not found")
+        
+        try:
+            current_idx = stages.index(order['status'])
+        except ValueError:
+            current_idx = -1
+            
+        # We only simulate up to DELIVERED. The buyer must manually trigger RELEASED.
+        if current_idx < len(stages) - 2: 
+            next_status = stages[current_idx + 1]
+            cursor.execute("UPDATE orders SET status = %s WHERE id = %s", (next_status, order_id))
+            conn.commit()
+            
+            background_tasks.add_task(send_email_alert, f"Order Update: {order_id}", f"Status automatically advanced to: {next_status}")
+            return {"status": "success", "new_status": next_status}
+            
+        return {"status": "success", "message": "Order is at DELIVERED. It is ready for Escrow Release by the Buyer in the UI."}
+    finally:
+        conn.close()
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8000)
