@@ -35,6 +35,9 @@ from reportlab.pdfgen import canvas
 from reportlab.lib.pagesizes import letter
 from reportlab.lib.units import inch
 from reportlab.lib import colors
+from reportlab.graphics.barcode import qr
+from reportlab.graphics.shapes import Drawing
+from reportlab.graphics import renderPDF
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("dagiv_celery")
@@ -412,6 +415,138 @@ def require_role(required_role: str):
         return user
     return role_checker
 
+def draw_enterprise_pdf(p, title, doc_id, user, items, total_amount, currency, status, is_quotation=False):
+    """Helper function to draw the enterprise-grade PDF layout"""
+    width, height = letter
+    
+    # 1. WATERMARK
+    p.saveState()
+    p.translate(width / 2, height / 2)
+    p.rotate(45)
+    p.setFont("Helvetica-Bold", 80)
+    p.setFillColor(colors.Color(0.9, 0.9, 0.9, alpha=0.5)) # Light gray, transparent
+    watermark_text = "PROFORMA QUOTATION" if is_quotation else ("PAID IN FULL" if status in ['FUNDS_SECURED', 'RELEASED', 'DELIVERED', 'IN_TRANSIT'] else "PENDING PAYMENT")
+    p.drawCentredString(0, 0, watermark_text)
+    p.restoreState()
+
+    # 2. HEADER
+    p.setFont("Helvetica-Bold", 28)
+    p.setFillColor(colors.HexColor("#eab308")) # DAGIV Yellow
+    p.drawString(50, height - 60, "DAGIV")
+    p.setFillColor(colors.HexColor("#0f172a")) # Slate
+    p.drawString(140, height - 60, "ENGINEERING")
+    
+    p.setFont("Helvetica-Bold", 16)
+    p.drawRightString(width - 50, height - 50, title)
+    p.setFont("Helvetica", 10)
+    p.drawRightString(width - 50, height - 65, f"Ref: {doc_id}")
+    p.drawRightString(width - 50, height - 80, f"Date: {datetime.now().strftime('%d %b %Y, %H:%M')}")
+
+    # 3. COMPANY & KRA DETAILS (Left)
+    p.setFont("Helvetica-Bold", 10)
+    p.drawString(50, height - 100, "FROM (MERCHANT OF RECORD):")
+    p.setFont("Helvetica", 10)
+    p.drawString(50, height - 115, "DAGIV Engineering Ltd.")
+    p.drawString(50, height - 130, "Industrial Area, Enterprise Rd, Nairobi")
+    p.drawString(50, height - 145, "KRA PIN: P051234567Z") # Replace with actual
+    p.drawString(50, height - 160, "Email: billing@dagiv.co.ke")
+
+    # 4. BUYER DETAILS (Right)
+    p.setFont("Helvetica-Bold", 10)
+    p.drawString(350, height - 100, "BILL TO:")
+    p.setFont("Helvetica", 10)
+    p.drawString(350, height - 115, f"Customer: {user.get('username', 'Guest').upper()}")
+    p.drawString(350, height - 130, f"Account ID: {user.get('user_id', 'N/A')[:8]}")
+    
+    # 5. LINE ITEMS TABLE HEADER
+    y = height - 210
+    p.setFont("Helvetica-Bold", 10)
+    p.setFillColor(colors.HexColor("#0f172a"))
+    p.rect(50, y-8, width-100, 22, fill=1)
+    p.setFillColor(colors.white)
+    p.drawString(60, y, "Item Description")
+    p.drawString(250, y, "Supplier")
+    p.drawString(380, y, "Qty")
+    p.drawString(430, y, "Unit Price")
+    p.drawString(500, y, "Total")
+    
+    # 6. LINE ITEMS
+    y -= 25
+    p.setFont("Helvetica", 9)
+    p.setFillColor(colors.black)
+    
+    subtotal = 0
+    for item in items:
+        desc = f"{item.get('brand', '')} {item.get('model', '')}"
+        supplier = item.get('seller_name', 'Verified Supplier')
+        qty = item.get('quantity', 1)
+        u_price = item.get('unit_price') or item.get('price', 0)
+        item_tot = u_price * qty
+        subtotal += item_tot
+        
+        p.drawString(60, y, desc[:35])
+        p.drawString(250, y, supplier[:20])
+        p.drawString(380, y, str(qty))
+        p.drawString(430, y, f"{u_price:,.2f}")
+        p.drawString(500, y, f"{item_tot:,.2f}")
+        y -= 20
+        p.setStrokeColor(colors.lightgrey)
+        p.line(50, y+10, width-50, y+10)
+
+    # 7. TOTALS & TAX CALCULATIONS (Assuming prices are VAT inclusive for this example)
+    vat_rate = 0.16
+    subtotal_ex_vat = subtotal / (1 + vat_rate)
+    vat_amount = subtotal - subtotal_ex_vat
+
+    y -= 20
+    p.setFont("Helvetica", 10)
+    p.drawRightString(480, y, "Subtotal (Excl. VAT):")
+    p.drawRightString(width - 50, y, f"{currency} {subtotal_ex_vat:,.2f}")
+    
+    y -= 15
+    p.drawRightString(480, y, "VAT (16%):")
+    p.drawRightString(width - 50, y, f"{currency} {vat_amount:,.2f}")
+
+    y -= 20
+    p.setFont("Helvetica-Bold", 12)
+    p.setFillColor(colors.HexColor("#16a34a")) if not is_quotation else p.setFillColor(colors.HexColor("#ea580c"))
+    p.drawRightString(480, y, "GRAND TOTAL:")
+    p.drawRightString(width - 50, y, f"{currency} {subtotal:,.2f}")
+
+    # 8. ETR & PAYMENT TERMS (Footer area)
+    y -= 50
+    p.setFillColor(colors.black)
+    p.setFont("Helvetica-Bold", 9)
+    p.drawString(50, y, "PAYMENT INSTRUCTIONS & TERMS:")
+    p.setFont("Helvetica", 8)
+    p.drawString(50, y-15, "All payments are held securely in DAGIV Escrow until delivery is confirmed.")
+    if is_quotation:
+        p.drawString(50, y-30, "This is a Quotation. Prices are valid for 14 days from the date of issue.")
+    else:
+        p.drawString(50, y-30, f"Payment Method: Escrow Gateway | Status: {status.replace('_', ' ')}")
+    
+    # 9. KRA ETR SECTION
+    p.setFont("Helvetica-Bold", 8)
+    p.drawString(50, 70, "------------------------------------------------------")
+    p.drawString(50, 60, "KRA ETR RECEIPT DETAILS")
+    p.setFont("Helvetica", 7)
+    p.drawString(50, 50, f"CUIN: DAGIV-{uuid.uuid4().hex[:10].upper()}")
+    p.drawString(50, 40, f"Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    p.drawString(50, 30, "This serves as a valid electronic tax receipt.")
+
+    # 10. QR CODE (Scannable verification)
+    qr_data = f"DAGIV|{doc_id}|{currency}{subtotal:,.2f}|{status}"
+    qr_code = qr.QrCodeWidget(qr_data)
+    bounds = qr_code.getBounds()
+    qr_width = bounds[2] - bounds[0]
+    qr_height = bounds[3] - bounds[1]
+    d = Drawing(60, 60, transform=[60/qr_width, 0, 0, 60/qr_height, 0, 0])
+    d.add(qr_code)
+    renderPDF.draw(d, p, width - 110, 30)
+
+    p.save()
+    return
+
 # --- 5. STARTUP & MIGRATIONS ---
 
 @app.on_event("startup")
@@ -722,7 +857,7 @@ def google_auth(req: GoogleAuthRequest):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
     
-@app.post("/api/login", response_model=Token)
+@app.post("/api/auth/login", response_model=Token)
 def login(login_data: LoginRequest):
     conn = get_db_connection()
     cursor = conn.cursor(cursor_factory=RealDictCursor)
@@ -825,6 +960,61 @@ def remove_from_cart(listing_id: str, user: dict = Depends(get_current_user)):
     finally:
         conn.close()
 
+@app.get("/api/cart/quotation")
+def generate_cart_quotation(user: dict = Depends(get_current_user)):
+    """Generates a Proforma Invoice/Quotation before the user makes a purchase"""
+    conn = get_db_connection()
+    cursor = conn.cursor(cursor_factory=RealDictCursor)
+    try:
+        # Fetch cart items
+        cursor.execute("""
+            SELECT c.quantity, l.brand, l.model, l.price as unit_price, l.seller_name, l.currency
+            FROM cart_items c
+            JOIN marketplace_listings l ON c.listing_id = l.id
+            WHERE c.user_id = %s
+        """, (user['user_id'],))
+        items = cursor.fetchall()
+        
+        if not items:
+            raise HTTPException(status_code=400, detail="Cart is empty. Cannot generate quotation.")
+
+        # Fetch user details
+        cursor.execute("SELECT username, email FROM users WHERE id = %s", (user['user_id'],))
+        user_info = cursor.fetchone()
+        user.update(user_info)
+
+        currency = items[0]['currency'] if items else "KES"
+        total = sum(item['unit_price'] * item['quantity'] for item in items)
+        quote_id = f"QT-{uuid.uuid4().hex[:8].upper()}"
+
+        buffer = BytesIO()
+        p = canvas.Canvas(buffer, pagesize=letter)
+        
+        draw_enterprise_pdf(
+            p=p, 
+            title="PROFORMA INVOICE", 
+            doc_id=quote_id, 
+            user=user, 
+            items=items, 
+            total_amount=total, 
+            currency=currency, 
+            status="QUOTATION", 
+            is_quotation=True
+        )
+        
+        buffer.seek(0)
+        return StreamingResponse(
+            buffer, 
+            media_type="application/pdf", 
+            headers={"Content-Disposition": f"attachment; filename=DAGIV_Quotation_{quote_id}.pdf"}
+        )
+
+    except Exception as e:
+        print(f"Quotation Gen Error: {e}")
+        raise HTTPException(status_code=500, detail="Failed to generate quotation")
+    finally:
+        conn.close()
+
 @app.get("/api/buyer/orders")
 def get_buyer_orders(user: dict = Depends(get_current_user)):
     """Fetches all orders for the logged-in buyer to populate the dashboard pipeline"""
@@ -900,80 +1090,45 @@ def get_buyer_orders(user: dict = Depends(get_current_user)):
         raise HTTPException(status_code=500, detail="Failed to fetch orders")
     finally:
         conn.close()
-
 @app.get("/api/orders/{order_id}/invoice")
 def generate_invoice(order_id: str, user: dict = Depends(get_current_user)):
-    """Dynamically generates a PDF commercial invoice using ReportLab"""
+    """Dynamically generates an Enterprise-Grade PDF commercial invoice/ETR"""
     conn = get_db_connection()
     cursor = conn.cursor(cursor_factory=RealDictCursor)
     try:
-        # 1. Verify ownership and fetch order
         cursor.execute("SELECT * FROM orders WHERE id = %s AND buyer_id = %s", (order_id, user['user_id']))
         order = cursor.fetchone()
         if not order:
             raise HTTPException(status_code=404, detail="Order not found")
 
-        # 2. Fetch Line Items
         cursor.execute("""
-            SELECT li.quantity, li.unit_price, m.brand, m.model
+            SELECT li.quantity, li.unit_price, m.brand, m.model, m.seller_name
             FROM order_line_items li
             JOIN marketplace_listings m ON li.listing_id = m.id
             WHERE li.order_id = %s
         """, (order_id,))
         items = cursor.fetchall()
 
+        cursor.execute("SELECT username, email FROM users WHERE id = %s", (user['user_id'],))
+        user_info = cursor.fetchone()
+        user.update(user_info)
+
         buffer = BytesIO()
         p = canvas.Canvas(buffer, pagesize=letter)
-        width, height = letter
-        p.setFont("Helvetica-Bold", 24)
-        p.setFillColor(colors.HexColor("#eab308")) # DAGIV Yellow
-        p.drawString(50, height - 50, "DAGIV ENGINEERING")
         
-        p.setFont("Helvetica", 10)
-        p.setFillColor(colors.gray)
-        p.drawString(50, height - 65, "Industrial Area, Enterprise Rd, Nairobi, Kenya | dagivengineeering@gmail.com | Payment Verified")
-        p.setFont("Helvetica-Bold", 14)
-        p.setFillColor(colors.black)
-        p.drawString(50, height - 100, "COMMERCIAL INVOICE")
+        draw_enterprise_pdf(
+            p=p, 
+            title="TAX INVOICE / ETR", 
+            doc_id=order['id'], 
+            user=user, 
+            items=items, 
+            total_amount=order['total_amount'], 
+            currency=order['currency'], 
+            status=order['status'], 
+            is_quotation=False
+        )
         
-        p.setFont("Helvetica", 10)
-        p.drawString(50, height - 120, f"Order ID: {order['id']}")
-        p.drawString(50, height - 135, f"Date: {order['created_at'].strftime('%Y-%m-%d')}")
-        p.drawString(50, height - 150, f"Payment Method: {order['payment_method']}")
-        y = height - 200
-        p.setFont("Helvetica-Bold", 10)
-        p.setFillColor(colors.HexColor("#0f172a")) # Slate-900
-        p.rect(50, y-5, width-100, 20, fill=1)
-        p.setFillColor(colors.white)
-        p.drawString(60, y, "Description")
-        p.drawString(300, y, "Qty")
-        p.drawString(380, y, "Unit Price")
-        p.drawString(480, y, "Total")
-        y -= 25
-        p.setFont("Helvetica", 10)
-        p.setFillColor(colors.black)
-        for item in items:
-            desc = f"{item['brand']} {item['model']}"
-            qty = str(item['quantity'])
-            u_price = f"{order['currency']} {item['unit_price']:,.2f}"
-            item_tot = f"{order['currency']} {(item['unit_price'] * item['quantity']):,.2f}"
-            
-            p.drawString(60, y, desc[:35])
-            p.drawString(300, y, qty)
-            p.drawString(380, y, u_price)
-            p.drawString(480, y, item_tot)
-            y -= 20
-            y -= 20
-            p.line(50, y+10, width-50, y+10)
-            p.setFont("Helvetica-Bold", 12)
-            p.drawString(380, y-10, "Total Paid:")
-            p.setFillColor(colors.HexColor("#eab308"))
-            p.drawString(480, y-10, f"{order['currency']} {order['total_amount']:,.2f}")
-            p.setFont("Helvetica-Oblique", 9)
-            p.setFillColor(colors.gray)
-            p.drawString(50, 50, "Thank you for trusting DAGIV Engineering, the world's trusted mechanical partner!")
-            p.save()
-            buffer.seek(0)
+        buffer.seek(0)
         return StreamingResponse(
             buffer, 
             media_type="application/pdf", 
@@ -1344,7 +1499,7 @@ def process_checkout(req: CheckoutProcessRequest, background_tasks: BackgroundTa
     cursor = conn.cursor(cursor_factory=RealDictCursor)
     try:
         cursor.execute("""
-            SELECT c.listing_id, c.quantity, l.price, l.seller_name, l.phone as seller_phone
+            SELECT c.listing_id, c.quantity, l.price, l.seller_name, l.phone as seller_phone, l.listing_type, l.category
             FROM cart_items c
             JOIN marketplace_listings l ON c.listing_id = l.id
             WHERE c.user_id = %s
@@ -1352,10 +1507,23 @@ def process_checkout(req: CheckoutProcessRequest, background_tasks: BackgroundTa
         items = cursor.fetchall()
         if not items: raise HTTPException(status_code=400, detail="Cart is empty")
 
-        subtotal = sum(i['price'] * i['quantity'] for i in items)
+        # Safely extract lease configs from the payload
+        lease_configs = req.shipping_details.get('lease_configurations', {}) if req.shipping_details else {}
+
+        subtotal = 0.0
+        for item in items:
+            # Check if this item is a lease
+            if item['listing_type'] == 'RENT' or item['category'] == 'Leasing':
+                config = lease_configs.get(item['listing_id'], {})
+                days = int(config.get('days', 1))
+                # For now, base price acts as DRY rate. (You can add wet_rate logic here later if added to DB)
+                subtotal += item['price'] * item['quantity'] * days
+            else:
+                subtotal += item['price'] * item['quantity']
+
         shipping_cost = 0.0 
-        escrow_fee = subtotal * 0.015 # Calculate 1.5% Escrow Fee
-        total = subtotal + shipping_cost + escrow_fee # Final charged amount
+        escrow_fee = subtotal * 0.015 # 1.5% Escrow Fee
+        total = subtotal + shipping_cost + escrow_fee # Accurate Grand Total
 
         order_id = f"ORD-{uuid.uuid4().hex[:8].upper()}"
         cursor.execute("""
@@ -1364,10 +1532,15 @@ def process_checkout(req: CheckoutProcessRequest, background_tasks: BackgroundTa
         """, (order_id, user['user_id'], total, req.payment_method, json.dumps(req.shipping_details)))
 
         for item in items:
+            # Ensure we save the exact unit price including the multiplier for record-keeping
+            multiplier = 1
+            if item['listing_type'] == 'RENT' or item['category'] == 'Leasing':
+                 multiplier = int(lease_configs.get(item['listing_id'], {}).get('days', 1))
+            
             cursor.execute("""
                 INSERT INTO order_line_items (order_id, listing_id, quantity, unit_price, seller_phone)
                 VALUES (%s, %s, %s, %s, %s)
-            """, (order_id, item['listing_id'], item['quantity'], item['price'], item['seller_phone']))
+            """, (order_id, item['listing_id'], item['quantity'], item['price'] * multiplier, item['seller_phone']))
 
         cursor.execute("DELETE FROM cart_items WHERE user_id = %s", (user['user_id'],))
         
