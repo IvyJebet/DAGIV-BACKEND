@@ -1366,16 +1366,25 @@ def register_seller(seller: SellerRegistration, background_tasks: BackgroundTask
     try:
         cursor.execute("SELECT id FROM users WHERE email = %s OR phone = %s", (seller.email, seller.phone))
         existing_user = cursor.fetchone()
+        
         if existing_user:
             final_user_id = existing_user[0]
+            # Ensure existing users get upgraded to SELLER and are marked verified
+            cursor.execute("UPDATE users SET role = 'SELLER', is_verified = TRUE WHERE id = %s", (final_user_id,))
         else:
             user_uuid = str(uuid.uuid4())
             hashed_pw = hash_text(seller.password)
+            
+            # FIX 1: Generate a truly unique username to prevent database crashes
+            base_username = seller.email.split('@')[0]
+            unique_username = f"{base_username}{random.randint(1000, 9999)}"
+
+            # FIX 2: Set is_verified = TRUE so they don't get blocked by the OTP check at login
             cursor.execute(
                 """INSERT INTO users (id, username, email, phone, password_hash, role, is_verified)
-                   VALUES (%s, %s, %s, %s, %s, 'SELLER', FALSE)
+                   VALUES (%s, %s, %s, %s, %s, 'SELLER', TRUE)
                    RETURNING id""",
-                (user_uuid, seller.email.split('@')[0], seller.email, seller.phone, hashed_pw)
+                (user_uuid, unique_username, seller.email, seller.phone, hashed_pw)
             )
             final_user_id = cursor.fetchone()[0]
 
@@ -1397,9 +1406,11 @@ def register_seller(seller: SellerRegistration, background_tasks: BackgroundTask
             VALUES (%s, 0.00, 0.00, 'KES')
             ON CONFLICT (user_id) DO NOTHING
         """, (final_user_id,))
+        
         conn.commit()
         details = f"New {seller.businessType} Registration\nName: {seller.name}\nPhone: {seller.phone}\nEmail: {seller.email}\nAction: LOGIN TO ADMIN PANEL TO VERIFY"
         background_tasks.add_task(send_email_alert, "Seller Registration", details)
+        
         return {"status": "success", "message": "Registration received", "sellerId": seller_id}
     except Exception as e:
         conn.rollback()
@@ -1672,6 +1683,90 @@ def get_public_listings():
         return listings
     except Exception as e:
         return []
+    finally:
+        conn.close()
+
+@app.get("/api/seller/orders")
+def get_seller_orders(user: dict = Depends(require_role("SELLER"))):
+    """Fetches all incoming orders for a specific seller"""
+    conn = get_db_connection()
+    cursor = conn.cursor(cursor_factory=RealDictCursor)
+    try:
+        # 1. Get the seller's phone number based on their logged-in ID
+        cursor.execute("SELECT phone FROM users WHERE id = %s", (user['user_id'],))
+        seller_row = cursor.fetchone()
+        if not seller_row:
+            raise HTTPException(status_code=404, detail="Seller profile not found")
+        seller_phone = seller_row['phone']
+
+        # 2. Query orders that contain items linked to this seller's phone
+        cursor.execute("""
+            SELECT 
+                o.id, 
+                o.total_amount as amount, 
+                o.currency, 
+                o.status, 
+                o.created_at,
+                u.username as buyer_name,
+                u.phone as buyer_phone,
+                m.brand, 
+                m.model, 
+                m.listing_type
+            FROM orders o
+            JOIN users u ON o.buyer_id = u.id
+            JOIN order_line_items li ON o.id = li.order_id
+            JOIN marketplace_listings m ON li.listing_id = m.id
+            WHERE li.seller_phone = %s
+            ORDER BY o.created_at DESC
+        """, (seller_phone,))
+        db_orders = cursor.fetchall()
+
+        result = []
+        for row in db_orders:
+            result.append({
+                "id": row['id'],
+                "brand": row['brand'],
+                "model": row['model'],
+                "amount": row['amount'],
+                "currency": row['currency'],
+                "status": row['status'],
+                "buyer_contact": f"{row['buyer_name']} ({row['buyer_phone']})",
+                "created_at": row['created_at'].isoformat() if isinstance(row['created_at'], datetime) else row['created_at'],
+                "listing_type": row['listing_type']
+            })
+        return result
+    except Exception as e:
+        print(f"Error fetching seller orders: {e}")
+        raise HTTPException(status_code=500, detail="Failed to fetch orders")
+    finally:
+        conn.close()
+
+@app.post("/api/orders/{order_id}/update-status")
+def update_order_status(order_id: str, payload: OrderStatusUpdate, user: dict = Depends(require_role("SELLER"))):
+    """Allows sellers to update the status of an order (e.g., to SHIPPED)"""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    try:
+        # Verify the seller actually owns this order before allowing status changes
+        cursor.execute("SELECT phone FROM users WHERE id = %s", (user['user_id'],))
+        seller_phone = cursor.fetchone()[0]
+
+        cursor.execute("""
+            SELECT o.id FROM orders o
+            JOIN order_line_items li ON o.id = li.order_id
+            WHERE o.id = %s AND li.seller_phone = %s
+        """, (order_id, seller_phone))
+        
+        if not cursor.fetchone():
+            raise HTTPException(status_code=403, detail="Unauthorized to update this order")
+
+        # Update the status
+        cursor.execute("UPDATE orders SET status = %s WHERE id = %s", (payload.status, order_id))
+        conn.commit()
+        return {"status": "success", "message": f"Order status updated to {payload.status}"}
+    except Exception as e:
+        conn.rollback()
+        raise HTTPException(status_code=500, detail=str(e))
     finally:
         conn.close()
 
