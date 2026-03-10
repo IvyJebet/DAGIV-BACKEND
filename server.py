@@ -225,6 +225,11 @@ class ShipmentUpdate(BaseModel):
     location: str
     notes: str
 
+class WithdrawRequest(BaseModel):
+    amount: float
+    method: str  # e.g., 'MPESA' or 'BANK'
+    account_alias: str  # phone number or bank account number
+    bank_name: Optional[str] = None
 # --- 3. NOTIFICATION SYSTEM (SYNC & ASYNC) ---
 
 def send_email_alert(category: str, details: str):
@@ -1512,32 +1517,39 @@ def get_seller_dashboard(user: dict = Depends(require_role("SELLER"))):
         if not seller_row:
             raise HTTPException(status_code=404, detail="Seller profile not found")
         seller_phone = seller_row['phone']
+        
         cursor.execute("SELECT balance_available, balance_pending, currency FROM wallets WHERE user_id = %s", (user['user_id'],))
         wallet = cursor.fetchone()
+        
         cursor.execute("""
-            SELECT 
-                COUNT(*) as total_listings,
-                COUNT(*) FILTER (WHERE status = 'ACTIVE') as active_listings
-            FROM marketplace_listings 
-            WHERE phone = %s
+            SELECT COUNT(*) as total_listings, COUNT(*) FILTER (WHERE status = 'ACTIVE') as active_listings
+            FROM marketplace_listings WHERE phone = %s
         """, (seller_phone,))
         inventory = cursor.fetchone()
         
-        # Updated to fetch full specs and listing_type so the Edit Form can pre-fill
         cursor.execute("""
             SELECT id, listing_type, category, sub_category, brand, model, price, currency, specs, status, created_at 
-            FROM marketplace_listings 
-            WHERE phone = %s 
-            ORDER BY created_at DESC 
-            LIMIT 20
+            FROM marketplace_listings WHERE phone = %s ORDER BY created_at DESC LIMIT 20
         """, (seller_phone,))
         recent_listings = cursor.fetchall()
+
+        # FETCH REAL RATING & COMPLETED ORDERS
+        cursor.execute("SELECT rating FROM sellers WHERE phone = %s", (seller_phone,))
+        seller_info = cursor.fetchone()
+        rating = seller_info['rating'] if seller_info else 0.0
+
+        cursor.execute("""
+            SELECT COUNT(DISTINCT o.id) FROM orders o
+            JOIN order_line_items li ON o.id = li.order_id
+            WHERE li.seller_phone = %s AND o.status = 'RELEASED'
+        """, (seller_phone,))
+        orders_completed = cursor.fetchone()['count']
 
         return {
             "wallet": wallet,
             "inventory": inventory,
             "listings": recent_listings,
-            "performance": {"rating": 4.8, "orders_completed": 0} 
+            "performance": {"rating": float(rating), "orders_completed": orders_completed} 
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail="Failed to load dashboard")
@@ -1650,24 +1662,31 @@ def release_escrow(order_id: str, user: dict = Depends(get_current_user)):
         cursor.execute("SELECT status FROM orders WHERE id = %s AND buyer_id = %s", (order_id, user['user_id']))
         order = cursor.fetchone()
         if not order: raise HTTPException(status_code=404, detail="Order not found")
-        if order['status'] != 'FUNDS_SECURED' and order['status'] != 'IN_TRANSIT':
+        if order['status'] != 'FUNDS_SECURED' and order['status'] != 'IN_TRANSIT' and order['status'] != 'DELIVERED':
             raise HTTPException(status_code=400, detail="Order is not in a releasable state")
 
         cursor.execute("UPDATE orders SET status = 'RELEASED' WHERE id = %s", (order_id,))
         cursor.execute("SELECT seller_phone, unit_price, quantity FROM order_line_items WHERE order_id = %s", (order_id,))
         items = cursor.fetchall()
+        
+        PLATFORM_COMMISSION = 0.05 # DAGIV takes a 5% cut
+
         for item in items:
             item_total = item['unit_price'] * item['quantity']
+            dagiv_cut = item_total * PLATFORM_COMMISSION
+            net_payout = item_total - dagiv_cut # Money going to seller
+            
             cursor.execute("SELECT id FROM users WHERE phone = %s", (item['seller_phone'],))
             seller = cursor.fetchone()
             if seller:
+                # Deduct full amount from pending, but only add the Net Payout to Available!
                 cursor.execute("""
                     UPDATE wallets 
                     SET balance_pending = balance_pending - %s, balance_available = balance_available + %s 
                     WHERE user_id = %s
-                """, (item_total, item_total, seller['id']))
+                """, (item_total, net_payout, seller['id']))
         conn.commit()
-        return {"status": "success", "message": "Funds have been released to the seller."}
+        return {"status": "success", "message": "Funds have been released to the seller (Commission deducted)."}
     finally: conn.close()
 
 @app.post("/api/payments/mpesa/callback")
@@ -1878,7 +1897,7 @@ def track_shipment(tracking_number: str):
 @app.post("/api/orders/{order_id}/simulate-flow")
 def simulate_order_flow(order_id: str, background_tasks: BackgroundTasks):
     """
-    Developer Tool: Advances the order status by one step so you can test the UI.
+    Developer Tool: Advances the order status by one step and executes wallet math.
     Does not require authentication.
     """
     stages = ['PENDING_PAYMENT', 'FUNDS_SECURED', 'INSPECTION_SCHEDULED', 'DISPATCHED', 'IN_TRANSIT', 'DELIVERED', 'RELEASED']
@@ -1894,18 +1913,105 @@ def simulate_order_flow(order_id: str, background_tasks: BackgroundTasks):
         except ValueError:
             current_idx = -1
             
-        # We only simulate up to DELIVERED. The buyer must manually trigger RELEASED.
-        if current_idx < len(stages) - 2: 
+        # Allow simulating all the way to the end (RELEASED)
+        if current_idx < len(stages) - 1: 
             next_status = stages[current_idx + 1]
+            
+            # --- MOCK FUND SECURING (Simulating M-Pesa Callback Math) ---
+            if next_status == 'FUNDS_SECURED':
+                cursor.execute("SELECT seller_phone, unit_price, quantity FROM order_line_items WHERE order_id = %s", (order_id,))
+                items = cursor.fetchall()
+                for item in items:
+                    item_total = item['unit_price'] * item['quantity']
+                    cursor.execute("SELECT id FROM users WHERE phone = %s", (item['seller_phone'],))
+                    seller = cursor.fetchone()
+                    if seller:
+                        cursor.execute("UPDATE wallets SET balance_pending = balance_pending + %s WHERE user_id = %s", (item_total, seller['id']))
+
+            # --- MOCK ESCROW RELEASE (Since buyer UI is deleted) ---
+            if next_status == 'RELEASED':
+                cursor.execute("SELECT seller_phone, unit_price, quantity FROM order_line_items WHERE order_id = %s", (order_id,))
+                items = cursor.fetchall()
+                PLATFORM_COMMISSION = 0.05 # DAGIV takes a 5% cut
+                
+                for item in items:
+                    item_total = item['unit_price'] * item['quantity']
+                    dagiv_cut = item_total * PLATFORM_COMMISSION
+                    net_payout = item_total - dagiv_cut # Money going to seller
+                    
+                    cursor.execute("SELECT id FROM users WHERE phone = %s", (item['seller_phone'],))
+                    seller = cursor.fetchone()
+                    if seller:
+                        cursor.execute("""
+                            UPDATE wallets 
+                            SET balance_pending = balance_pending - %s, balance_available = balance_available + %s 
+                            WHERE user_id = %s
+                        """, (item_total, net_payout, seller['id']))
+
+            # Update the order status string
             cursor.execute("UPDATE orders SET status = %s WHERE id = %s", (next_status, order_id))
             conn.commit()
             
             background_tasks.add_task(send_email_alert, f"Order Update: {order_id}", f"Status automatically advanced to: {next_status}")
-            return {"status": "success", "new_status": next_status}
+            return {"status": "success", "new_status": next_status, "message": f"Successfully moved to {next_status} and applied wallet logic."}
             
-        return {"status": "success", "message": "Order is at DELIVERED. It is ready for Escrow Release by the Buyer in the UI."}
+        return {"status": "success", "message": "Order is already at RELEASED. Funds are securely in the Available Balance."}
     finally:
         conn.close()
+        
+@app.post("/api/wallet/withdraw")
+def request_withdrawal(req: WithdrawRequest, background_tasks: BackgroundTasks, user: dict = Depends(require_role("SELLER"))):
+    conn = get_db_connection()
+    cursor = conn.cursor(cursor_factory=RealDictCursor)
+    try:
+        # 1. Check wallet balance
+        cursor.execute("SELECT balance_available FROM wallets WHERE user_id = %s", (user['user_id'],))
+        wallet = cursor.fetchone()
+        
+        if not wallet:
+            raise HTTPException(status_code=400, detail="Wallet not found for this user.")
+            
+        # Ensure we safely handle NULL database values
+        available_balance = wallet.get('balance_available') or 0.0
+        
+        if available_balance < req.amount:
+            raise HTTPException(status_code=400, detail=f"Insufficient funds. You only have KES {available_balance:,.2f} available.")
+        if req.amount < 100:
+            raise HTTPException(status_code=400, detail="Minimum withdrawal is KES 100.")
 
+        # 2. Deduct from wallet
+        cursor.execute("""
+            UPDATE wallets SET balance_available = balance_available - %s WHERE user_id = %s
+        """, (req.amount, user['user_id']))
+
+        # 3. Log the transaction
+        trx_id = str(uuid.uuid4())
+        
+        # Format the destination depending on the selected method
+        destination_info = f"{req.bank_name} - {req.account_alias}" if req.method == 'BANK' else req.account_alias
+        
+        cursor.execute("""
+            INSERT INTO transactions (id, order_id, amount, type, status, phone_number)
+            VALUES (%s, NULL, %s, %s, 'COMPLETED', %s)
+        """, (trx_id, req.amount, f"PAYOUT_{req.method}", destination_info))
+
+        conn.commit()
+        
+        method_str = "M-Pesa" if req.method == "MPESA" else "Bank Transfer"
+        details = f"Withdrawal processed for KES {req.amount} via {method_str} to {destination_info}. Trx ID: {trx_id}"
+        background_tasks.add_task(send_email_alert, "Seller Payout", details)
+        
+        return {"status": "success", "message": f"Withdrawal successful. Funds sent via {method_str}."}
+        
+    except HTTPException as he:
+        conn.rollback()
+        raise he
+    except Exception as e:
+        conn.rollback()
+        print(f"🔥 Withdrawal Crash: {traceback.format_exc()}") 
+        raise HTTPException(status_code=500, detail=f"Internal Server Error: {str(e)}")
+    finally:
+        cursor.close()
+        conn.close()
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8000)
