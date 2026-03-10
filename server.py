@@ -1668,8 +1668,11 @@ def get_public_listings():
     cursor = conn.cursor(cursor_factory=RealDictCursor)
     try:
         cursor.execute("""
-            SELECT id, listing_type as "listingType", seller_name as "sellerName", phone, location, category, sub_category as "subCategory", brand, model, price, currency, specs, status, created_at 
-            FROM marketplace_listings WHERE status = 'ACTIVE' ORDER BY created_at DESC
+            SELECT m.id, m.listing_type as "listingType", m.seller_name as "sellerName", m.phone, m.location, m.category, m.sub_category as "subCategory", m.brand, m.model, m.price, m.currency, m.specs, m.status, m.created_at,
+                   s.id as seller_id, s.name as real_seller_name, s.rating as seller_rating, s.joined_date as seller_joined_date, s.business_type as seller_type, s.status as seller_status
+            FROM marketplace_listings m
+            LEFT JOIN sellers s ON m.phone = s.phone
+            WHERE m.status = 'ACTIVE' ORDER BY m.created_at DESC
         """)
         listings = cursor.fetchall()
         for item in listings:
@@ -1679,9 +1682,20 @@ def get_public_listings():
                     item['images'] = item['specs']['images']
                 else:
                     item['images'] = ["https://via.placeholder.com/300?text=No+Image"]
-                item['verifiedByDagiv'] = True
+            item['verifiedByDagiv'] = True
+            
+            if item.get("real_seller_name"):
+                item["seller"] = {
+                    "id": item["seller_id"],
+                    "name": item["real_seller_name"],
+                    "rating": float(item["seller_rating"]) if item["seller_rating"] is not None else 0.0,
+                    "joinedDate": item["seller_joined_date"].isoformat() if item["seller_joined_date"] else item["created_at"].isoformat(),
+                    "type": item["seller_type"],
+                    "verified": item["seller_status"] == 'VERIFIED'
+                }
         return listings
     except Exception as e:
+        print(e)
         return []
     finally:
         conn.close()
