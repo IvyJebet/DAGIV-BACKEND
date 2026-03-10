@@ -1464,6 +1464,44 @@ def submit_listing(item: MarketListing, background_tasks: BackgroundTasks, user:
     except Exception as e:
         return {"status": "error", "detail": str(e)}
 
+# --- NEW: EDIT LISTING ENDPOINT ---
+@app.put("/api/marketplace/edit/{listing_id}")
+def edit_listing(listing_id: str, item: MarketListing, user: dict = Depends(get_current_user)):
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        
+        # Verify the user actually owns this listing
+        cursor.execute("SELECT phone FROM users WHERE id = %s", (user['user_id'],))
+        user_row = cursor.fetchone()
+        if not user_row: 
+            raise HTTPException(status_code=404, detail="User profile not found")
+        db_phone = user_row[0]
+        
+        cursor.execute("SELECT phone FROM marketplace_listings WHERE id = %s", (listing_id,))
+        listing = cursor.fetchone()
+        
+        if not listing or listing[0] != db_phone:
+            raise HTTPException(status_code=403, detail="Unauthorized: You can only edit your own listings.")
+            
+        specs_json = json.dumps(item.specs)
+        
+        cursor.execute("""
+            UPDATE marketplace_listings 
+            SET listing_type = %s, category = %s, sub_category = %s, brand = %s, 
+                model = %s, price = %s, currency = %s, specs = %s, location = %s
+            WHERE id = %s
+        """, (item.listingType, item.category, item.subCategory, item.brand, 
+              item.model, item.price, item.currency, specs_json, item.location, listing_id))
+              
+        conn.commit()
+        return {"status": "success", "message": "Listing updated successfully"}
+    except Exception as e:
+        conn.rollback()
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        conn.close()
+
 @app.get("/api/seller/dashboard")
 def get_seller_dashboard(user: dict = Depends(require_role("SELLER"))):
     conn = get_db_connection()
@@ -1484,12 +1522,14 @@ def get_seller_dashboard(user: dict = Depends(require_role("SELLER"))):
             WHERE phone = %s
         """, (seller_phone,))
         inventory = cursor.fetchone()
+        
+        # Updated to fetch full specs and listing_type so the Edit Form can pre-fill
         cursor.execute("""
-            SELECT id, brand, model, price, currency, status, created_at 
+            SELECT id, listing_type, category, sub_category, brand, model, price, currency, specs, status, created_at 
             FROM marketplace_listings 
             WHERE phone = %s 
             ORDER BY created_at DESC 
-            LIMIT 5
+            LIMIT 20
         """, (seller_phone,))
         recent_listings = cursor.fetchall()
 
