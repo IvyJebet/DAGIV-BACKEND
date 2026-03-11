@@ -38,6 +38,7 @@ from reportlab.lib import colors
 from reportlab.graphics.barcode import qr
 from reportlab.graphics.shapes import Drawing
 from reportlab.graphics import renderPDF
+from routers.support import router as support_router
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("dagiv_celery")
@@ -81,6 +82,8 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+app.include_router(support_router)
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="api/auth/login")
 class UserRegister(BaseModel):
     email: str
@@ -380,6 +383,32 @@ def update_shipment_status_async(self, tracking_number: str, new_status: str, lo
         return f"Successfully updated {tracking_number} to {new_status}"
     except Exception as exc:
         raise self.retry(exc=exc, countdown=30)
+    
+@celery_app.task(name="server.auto_close_stale_tickets")
+def auto_close_stale_tickets():
+    """Runs daily to close resolved tickets after 7 days of inactivity."""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    try:
+        # Find tickets resolved > 7 days ago
+        cursor.execute("""
+            UPDATE support_tickets 
+            SET status = 'CLOSED', updated_at = CURRENT_TIMESTAMP
+            WHERE status = 'RESOLVED' 
+            AND updated_at < CURRENT_TIMESTAMP - INTERVAL '7 days'
+            RETURNING id
+        """)
+        closed_tickets = cursor.fetchall()
+        conn.commit()
+        
+        logger.info(f"Auto-closed {len(closed_tickets)} stale tickets.")
+        return f"Closed {len(closed_tickets)} tickets"
+    except Exception as e:
+        conn.rollback()
+        logger.error(f"Failed to auto-close tickets: {e}")
+    finally:
+        cursor.close()
+        conn.close()
 
 # --- 4. HELPERS ---
 def get_db_connection():
@@ -645,7 +674,33 @@ def startup_db():
         )
     """)
     
-    # 5. Migrations (Self-Healing)
+    # 5. Support Ticketing System
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS support_tickets (
+            id TEXT PRIMARY KEY,
+            buyer_id UUID REFERENCES users(id),         -- Changed TEXT to UUID
+            subject TEXT NOT NULL,
+            category TEXT NOT NULL,
+            status TEXT DEFAULT 'OPEN',
+            priority TEXT DEFAULT 'MEDIUM',
+            assigned_agent_id UUID REFERENCES users(id), -- Changed TEXT to UUID
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    ''')
+
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS ticket_messages (
+            id TEXT PRIMARY KEY,
+            ticket_id TEXT REFERENCES support_tickets(id) ON DELETE CASCADE,
+            sender_id UUID REFERENCES users(id),         -- Changed TEXT to UUID
+            message TEXT NOT NULL,
+            is_internal_note BOOLEAN DEFAULT FALSE,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    ''')
+    
+    # 6. Migrations (Self-Healing)
     try:
         cursor.execute("ALTER TABLE orders ADD COLUMN IF NOT EXISTS listing_id TEXT")
         cursor.execute("ALTER TABLE orders ADD COLUMN IF NOT EXISTS seller_phone TEXT")
