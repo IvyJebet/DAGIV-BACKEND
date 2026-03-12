@@ -199,7 +199,16 @@ def get_ticket_details(ticket_id: str, user: dict = Depends(get_current_user)):
             
         msg_query += " ORDER BY m.created_at ASC"
         cursor.execute(msg_query, (ticket_id,))
-        ticket['messages'] = cursor.fetchall()
+        messages = cursor.fetchall()
+
+        # FIX: Force the display name to 'Support Team' on the backend level 
+        # to guarantee it overrides the actual db username of "ADMIN"
+        for msg in messages:
+            role = str(msg.get('sender_role', '')).upper()
+            if role in ['ADMIN', 'SUPPORT']:
+                msg['sender_name'] = 'Support Team'
+
+        ticket['messages'] = messages
 
         # Check Typing Cache for real-time polling
         is_typing = False
