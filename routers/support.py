@@ -1,70 +1,175 @@
 import os
 import uuid
+import json
+import asyncio
+import boto3
+from botocore.exceptions import ClientError
 from datetime import datetime, timedelta
-import psycopg2
-from psycopg2.extras import RealDictCursor
-from fastapi import APIRouter, HTTPException, Depends, status
+from fastapi import APIRouter, HTTPException, Depends, status, WebSocket, WebSocketDisconnect
 from fastapi.security import OAuth2PasswordBearer
 from jose import JWTError, jwt
 from pydantic import BaseModel, Field
-from typing import Optional, List
+from typing import Optional, List, Dict
 from dotenv import load_dotenv
+
+# --- SQLAlchemy 2.0 & AsyncPG ---
+from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
+from sqlalchemy.orm import declarative_base, sessionmaker
+from sqlalchemy import Column, String, Boolean, DateTime, select, func, update
+from sqlalchemy.dialects.postgresql import JSONB
+import redis.asyncio as aioredis
 
 load_dotenv()
 
 # =====================================================================
-# --- 0. STANDALONE DEPENDENCIES ---
+# --- 0. DB & REDIS CONFIGURATION ---
 # =====================================================================
-DATABASE_URL = os.getenv("DATABASE_URL")
 SECRET_KEY = "DAGIV_SUPER_SECRET_KEY_CHANGE_THIS_IN_PROD"
 ALGORITHM = "HS256"
 
+# Setup Async SQLAlchemy Engine
+# Dynamically and safely clean the URL so psycopg2 in server.py doesn't crash
+raw_db_url = os.getenv("DATABASE_URL", "").strip().strip('"').strip("'")
+
+# Fallback: Catch accidental duplications from the .env file
+if raw_db_url.startswith("DATABASE_URL="):
+    raw_db_url = raw_db_url.replace("DATABASE_URL=", "", 1).strip().strip('"').strip("'")
+
+# Inject the async driver
+if raw_db_url.startswith("postgresql://"):
+    async_db_url = raw_db_url.replace("postgresql://", "postgresql+asyncpg://", 1)
+elif raw_db_url.startswith("postgres://"):
+    async_db_url = raw_db_url.replace("postgres://", "postgresql+asyncpg://", 1)
+else:
+    async_db_url = raw_db_url
+
+engine = create_async_engine(async_db_url, echo=False)
+AsyncSessionLocal = sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
+
+# Setup Redis for WebSockets
+redis_client = aioredis.from_url(os.getenv("REDIS_URL"))
+
+# Setup S3 Client pointing to Supabase Storage
+s3_client = boto3.client(
+    's3',
+    aws_access_key_id=os.getenv('SUPABASE_ACCESS_KEY_ID'),
+    aws_secret_access_key=os.getenv('SUPABASE_SECRET_ACCESS_KEY'),
+    region_name=os.getenv('SUPABASE_S3_REGION'),
+    endpoint_url=os.getenv('SUPABASE_S3_ENDPOINT')
+)
+BUCKET_NAME = os.getenv('SUPABASE_S3_BUCKET_NAME')
+
+async def get_db():
+    async with AsyncSessionLocal() as session:
+        yield session
+
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="api/auth/login")
 
-def get_db_connection():
-    return psycopg2.connect(DATABASE_URL)
-
 async def get_current_user(token: str = Depends(oauth2_scheme)):
-    credentials_exception = HTTPException(
-        status_code=status.HTTP_401_UNAUTHORIZED,
-        detail="Could not validate credentials",
-        headers={"WWW-Authenticate": "Bearer"},
-    )
     try:
         payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
         user_id: str = payload.get("sub")
-        role: str = payload.get("role")
-        
         if user_id is None:
-            raise credentials_exception
-            
-        return {"user_id": user_id, "role": role}
-        
+            raise HTTPException(status_code=401)
+        return {"user_id": user_id, "role": payload.get("role")}
     except JWTError:
-        raise credentials_exception
+        raise HTTPException(status_code=401)
+
+# =====================================================================
+# --- 1. SQLALCHEMY ORM MODELS ---
+# =====================================================================
+Base = declarative_base()
+
+class User(Base):
+    __tablename__ = 'users'
+    id = Column(String, primary_key=True)
+    username = Column(String)
+    role = Column(String)
+
+class SupportTicket(Base):
+    __tablename__ = 'support_tickets'
+    id = Column(String, primary_key=True)
+    buyer_id = Column(String)
+    assigned_agent_id = Column(String, nullable=True)
+    subject = Column(String)
+    category = Column(String)
+    priority = Column(String)
+    status = Column(String)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+class TicketMessage(Base):
+    __tablename__ = 'ticket_messages'
+    id = Column(String, primary_key=True)
+    ticket_id = Column(String)
+    sender_id = Column(String)
+    message = Column(String)
+    is_internal_note = Column(Boolean, default=False)
+    is_read = Column(Boolean, default=False)
+    attachments = Column(JSONB, default=list)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+# =====================================================================
+# --- 2. REDIS PUB/SUB WEBSOCKET MANAGER ---
+# =====================================================================
+class ConnectionManager:
+    def __init__(self):
+        self.active_connections: Dict[str, List[WebSocket]] = {}
+
+    async def connect(self, websocket: WebSocket, ticket_id: str):
+        await websocket.accept()
+        if ticket_id not in self.active_connections:
+            self.active_connections[ticket_id] = []
+        self.active_connections[ticket_id].append(websocket)
+
+    def disconnect(self, websocket: WebSocket, ticket_id: str):
+        if ticket_id in self.active_connections:
+            self.active_connections[ticket_id].remove(websocket)
+
+    async def broadcast(self, ticket_id: str, message: dict):
+        # Publish globally via Redis instead of just local worker
+        await redis_client.publish(f"ticket_{ticket_id}", json.dumps(message))
+
+manager = ConnectionManager()
+
+# Background task to listen to Redis channels
+async def redis_listener():
+    pubsub = redis_client.pubsub()
+    await pubsub.psubscribe("ticket_*")
+    async for message in pubsub.listen():
+        if message["type"] == "pmessage":
+            channel = message["channel"].decode()
+            ticket_id = channel.split("_")[1]
+            data = json.loads(message["data"].decode())
+            
+            if ticket_id in manager.active_connections:
+                for connection in manager.active_connections[ticket_id]:
+                    try:
+                        await connection.send_json(data)
+                    except Exception:
+                        pass
 
 router = APIRouter()
 
-# Global memory cache for short-polling typing indicators
-# Structure: { ticket_id: { user_id: timestamp } }
-typing_cache = {}
+@router.on_event("startup")
+async def startup_event():
+    # Start Redis listener on server boot
+    asyncio.create_task(redis_listener())
 
 # =====================================================================
-# --- 1. PYDANTIC VALIDATION MODELS ---
+# --- 3. PYDANTIC SCHEMAS ---
 # =====================================================================
-
 class TicketCreate(BaseModel):
     subject: str = Field(min_length=5, max_length=150)
     category: str
     priority: str = "MEDIUM"
     initial_message: str = Field(min_length=10)
+    attachments: List[str] = []
 
 class MessageCreate(BaseModel):
-    message: str = Field(min_length=2)
+    message: str
     is_internal_note: bool = False
-
-class TicketStatusUpdate(BaseModel):
-    status: str
+    attachments: List[str] = []
 
 class TicketUpdate(BaseModel):
     status: Optional[str] = None
@@ -74,264 +179,238 @@ class TypingUpdate(BaseModel):
     is_typing: bool
 
 # =====================================================================
-# --- 2. API ROUTES ---
+# --- 4. ROUTES ---
 # =====================================================================
 
-@router.post("/api/support/tickets")
-def create_ticket(req: TicketCreate, user: dict = Depends(get_current_user)):
-    conn = get_db_connection()
-    cursor = conn.cursor(cursor_factory=RealDictCursor)
+@router.get("/api/support/upload-url")
+async def get_upload_url(file_name: str, file_type: str, user: dict = Depends(get_current_user)):
+    """Generate an S3 Pre-signed URL targeted at Supabase Storage"""
+    file_key = f"support/{user['user_id']}/{uuid.uuid4().hex[:8]}_{file_name}"
     try:
-        ticket_id = f"TKT-{uuid.uuid4().hex[:8].upper()}"
-        msg_id = str(uuid.uuid4())
+        presigned_url = s3_client.generate_presigned_url(
+            'put_object',
+            Params={'Bucket': BUCKET_NAME, 'Key': file_key, 'ContentType': file_type},
+            ExpiresIn=3600
+        )
+        # Convert the S3 endpoint to a Supabase Public URL for direct image viewing
+        base_url = os.getenv('SUPABASE_S3_ENDPOINT').replace('/s3', '/object/public')
+        file_url = f"{base_url}/{BUCKET_NAME}/{file_key}"
         
-        cursor.execute("""
-            INSERT INTO support_tickets (id, buyer_id, subject, category, priority, status)
-            VALUES (%s, %s, %s, %s, %s, 'OPEN')
-        """, (ticket_id, user['user_id'], req.subject, req.category, req.priority))
-        
-        cursor.execute("""
-            INSERT INTO ticket_messages (id, ticket_id, sender_id, message)
-            VALUES (%s, %s, %s, %s)
-        """, (msg_id, ticket_id, user['user_id'], req.initial_message))
-        
-        conn.commit()
-        return {"status": "success", "ticket_id": ticket_id, "message": "Ticket created successfully."}
+        return {"upload_url": presigned_url, "file_url": file_url}
     except Exception as e:
-        conn.rollback()
         raise HTTPException(status_code=500, detail=str(e))
-    finally:
-        cursor.close()
-        conn.close()
 
+@router.websocket("/api/support/tickets/{ticket_id}/ws")
+async def websocket_endpoint(websocket: WebSocket, ticket_id: str, token: str):
+    try:
+        user = await get_current_user(token)
+        await manager.connect(websocket, ticket_id)
+        while True:
+            data = await websocket.receive_json()
+            if data.get("type") == "TYPING":
+                await manager.broadcast(ticket_id, {
+                    "type": "TYPING",
+                    "user_id": user['user_id'],
+                    "is_typing": data.get("is_typing", False),
+                    "sender_name": "Support Team" if user.get('role', '').upper() in ['ADMIN', 'SUPPORT'] else "Buyer"
+                })
+    except WebSocketDisconnect:
+        manager.disconnect(websocket, ticket_id)
+    except Exception:
+        await websocket.close()
+
+@router.post("/api/support/tickets")
+async def create_ticket(req: TicketCreate, user: dict = Depends(get_current_user), db: AsyncSession = Depends(get_db)):
+    ticket_id = f"TKT-{uuid.uuid4().hex[:8].upper()}"
+    msg_id = str(uuid.uuid4())
+    
+    new_ticket = SupportTicket(
+        id=ticket_id, buyer_id=user['user_id'], subject=req.subject, 
+        category=req.category, priority=req.priority, status='OPEN'
+    )
+    new_message = TicketMessage(
+        id=msg_id, ticket_id=ticket_id, sender_id=user['user_id'], 
+        message=req.initial_message, attachments=req.attachments
+    )
+    
+    db.add(new_ticket)
+    db.add(new_message)
+    await db.commit()
+    return {"status": "success", "ticket_id": ticket_id}
 
 @router.get("/api/support/tickets")
-def get_tickets(page: int = 1, limit: int = 10, status: Optional[str] = None, user: dict = Depends(get_current_user)):
-    conn = get_db_connection()
-    cursor = conn.cursor(cursor_factory=RealDictCursor)
-    try:
-        offset = (page - 1) * limit
-        user_role = str(user.get('role', '')).upper()
-        
-        # Base queries
-        count_query = "SELECT COUNT(*) as total FROM support_tickets t WHERE 1=1"
-        data_query = """
-            SELECT t.id, t.subject, t.category, t.status, t.priority, t.created_at, t.updated_at, u.username as buyer_name,
-            (SELECT COUNT(*) FROM ticket_messages tm WHERE tm.ticket_id = t.id AND tm.is_read = FALSE AND tm.sender_id != %s) as unread_count
-            FROM support_tickets t
-            JOIN users u ON t.buyer_id = u.id
-            WHERE 1=1
-        """
-        
-        # Params for the data_query start with the user_id for the unread_count subquery
-        data_params = [user['user_id']]
-        count_params = []
+async def get_tickets(page: int = 1, limit: int = 10, status: Optional[str] = None, user: dict = Depends(get_current_user), db: AsyncSession = Depends(get_db)):
+    offset = (page - 1) * limit
+    user_role = str(user.get('role', '')).upper()
+    
+    # Subquery to calculate unread counts dynamically
+    unread_subq = select(func.count()).where(
+        TicketMessage.ticket_id == SupportTicket.id,
+        TicketMessage.is_read == False,
+        TicketMessage.sender_id != user['user_id']
+    ).scalar_subquery()
 
-        # Role-based scoping
-        if user_role not in ['ADMIN', 'SUPPORT']:
-            count_query += " AND t.buyer_id = %s"
-            data_query += " AND t.buyer_id = %s"
-            count_params.append(user['user_id'])
-            data_params.append(user['user_id'])
-            
-        # Status filtering
-        if status and status != 'ALL':
-            count_query += " AND t.status = %s"
-            data_query += " AND t.status = %s"
-            count_params.append(status)
-            data_params.append(status)
+    query = select(SupportTicket, User.username.label("buyer_name"), unread_subq.label("unread_count"))\
+        .join(User, SupportTicket.buyer_id == User.id)
 
-        # Absolute Top Sorting: Unread first, then mostly recently updated
-        data_query += " ORDER BY unread_count DESC, t.updated_at DESC LIMIT %s OFFSET %s"
-        data_params.extend([limit, offset])
-        
-        cursor.execute(count_query, tuple(count_params) if count_params else None)
-        total_row = cursor.fetchone()
-        total = total_row['total'] if total_row else 0
-        
-        cursor.execute(data_query, tuple(data_params))
-        tickets = cursor.fetchall()
-        
-        return {"total": total, "page": page, "limit": limit, "tickets": tickets}
-    finally:
-        cursor.close()
-        conn.close()
+    if user_role not in ['ADMIN', 'SUPPORT']:
+        query = query.where(SupportTicket.buyer_id == user['user_id'])
+    if status and status != 'ALL':
+        query = query.where(SupportTicket.status == status)
 
+    # Absolute Top Sorting
+    query = query.order_by(unread_subq.desc(), SupportTicket.updated_at.desc()).offset(offset).limit(limit)
+    
+    result = await db.execute(query)
+    rows = result.fetchall()
+    
+    # Count Total Pagination
+    count_q = select(func.count()).select_from(SupportTicket)
+    if user_role not in ['ADMIN', 'SUPPORT']:
+        count_q = count_q.where(SupportTicket.buyer_id == user['user_id'])
+    total = (await db.execute(count_q)).scalar()
+
+    tickets = [{
+        **t.SupportTicket.__dict__, 
+        "buyer_name": t.buyer_name, 
+        "unread_count": t.unread_count
+    } for t in rows]
+    
+    return {"total": total, "page": page, "limit": limit, "tickets": tickets}
 
 @router.get("/api/support/tickets/{ticket_id}")
-def get_ticket_details(ticket_id: str, user: dict = Depends(get_current_user)):
-    conn = get_db_connection()
-    cursor = conn.cursor(cursor_factory=RealDictCursor)
-    try:
-        user_role = str(user.get('role', '')).upper()
+async def get_ticket_details(ticket_id: str, user: dict = Depends(get_current_user), db: AsyncSession = Depends(get_db)):
+    user_role = str(user.get('role', '')).upper()
+    
+    t_query = select(SupportTicket, User.username.label("buyer_name")).join(User, SupportTicket.buyer_id == User.id).where(SupportTicket.id == ticket_id)
+    t_result = (await db.execute(t_query)).first()
+    
+    if not t_result:
+        raise HTTPException(status_code=404, detail="Ticket not found")
+    
+    ticket_data = {**t_result.SupportTicket.__dict__, "buyer_name": t_result.buyer_name}
+    
+    if user_role not in ['ADMIN', 'SUPPORT'] and ticket_data['buyer_id'] != user['user_id']:
+        raise HTTPException(status_code=403, detail="Unauthorized")
+
+    # Auto-mark as read
+    await db.execute(
+        update(TicketMessage).where(TicketMessage.ticket_id == ticket_id, TicketMessage.sender_id != user['user_id'], TicketMessage.is_read == False)
+        .values(is_read=True)
+    )
+    await db.commit()
+
+    # Fetch Messages
+    m_query = select(TicketMessage, User.username.label("sender_name"), User.role.label("sender_role")).join(User, TicketMessage.sender_id == User.id).where(TicketMessage.ticket_id == ticket_id).order_by(TicketMessage.created_at.asc())
+    
+    if user_role not in ['ADMIN', 'SUPPORT']:
+        m_query = m_query.where(TicketMessage.is_internal_note == False)
         
-        cursor.execute("""
-            SELECT t.*, u.username as buyer_name 
-            FROM support_tickets t
-            JOIN users u ON t.buyer_id = u.id
-            WHERE t.id = %s
-        """, (ticket_id,))
-        ticket = cursor.fetchone()
+    m_result = await db.execute(m_query)
+    messages = []
+    
+    for m in m_result.fetchall():
+        msg_dict = {
+            "id": m.TicketMessage.id,
+            "ticket_id": m.TicketMessage.ticket_id,
+            "sender_id": m.TicketMessage.sender_id,
+            "message": m.TicketMessage.message,
+            "is_internal_note": m.TicketMessage.is_internal_note,
+            "is_read": m.TicketMessage.is_read,
+            "attachments": m.TicketMessage.attachments or [],
+            "created_at": m.TicketMessage.created_at.isoformat() + "Z",
+        }
+        # Enforce Professional Naming Override
+        msg_dict['sender_name'] = 'Support Team' if str(m.sender_role).upper() in ['ADMIN', 'SUPPORT'] else m.sender_name
+        messages.append(msg_dict)
         
-        if not ticket:
-            raise HTTPException(status_code=404, detail="Ticket not found")
-            
-        if user_role not in ['ADMIN', 'SUPPORT'] and str(ticket['buyer_id']) != str(user['user_id']):
-            raise HTTPException(status_code=403, detail="Unauthorized access to this ticket")
-
-        # Automatically mark all messages from the OTHER party as read when viewing the thread
-        cursor.execute("""
-            UPDATE ticket_messages 
-            SET is_read = TRUE 
-            WHERE ticket_id = %s AND sender_id != %s AND is_read = FALSE
-        """, (ticket_id, user['user_id']))
-        conn.commit()
-            
-        msg_query = """
-            SELECT m.id, m.message, m.is_internal_note, m.created_at, m.is_read, m.sender_id, u.username as sender_name, u.role as sender_role
-            FROM ticket_messages m
-            JOIN users u ON m.sender_id = u.id
-            WHERE m.ticket_id = %s
-        """
-        
-        if user_role not in ['ADMIN', 'SUPPORT']:
-            msg_query += " AND m.is_internal_note = FALSE"
-            
-        msg_query += " ORDER BY m.created_at ASC"
-        cursor.execute(msg_query, (ticket_id,))
-        messages = cursor.fetchall()
-
-        # FIX: Force the display name to 'Support Team' on the backend level 
-        # to guarantee it overrides the actual db username of "ADMIN"
-        for msg in messages:
-            role = str(msg.get('sender_role', '')).upper()
-            if role in ['ADMIN', 'SUPPORT']:
-                msg['sender_name'] = 'Support Team'
-
-        ticket['messages'] = messages
-
-        # Check Typing Cache for real-time polling
-        is_typing = False
-        if ticket_id in typing_cache:
-            now = datetime.now()
-            for uid, tstamp in list(typing_cache[ticket_id].items()):
-                if str(uid) != str(user['user_id']) and now - tstamp < timedelta(seconds=4):
-                    is_typing = True
-                    
-        ticket['other_party_typing'] = is_typing
-        return ticket
-    finally:
-        cursor.close()
-        conn.close()
-
+    ticket_data['messages'] = messages
+    return ticket_data
 
 @router.post("/api/support/tickets/{ticket_id}/messages")
-def add_ticket_message(ticket_id: str, req: MessageCreate, user: dict = Depends(get_current_user)):
-    conn = get_db_connection()
-    cursor = conn.cursor(cursor_factory=RealDictCursor)
-    try:
-        user_role = str(user.get('role', '')).upper()
-        
-        cursor.execute("SELECT buyer_id, status FROM support_tickets WHERE id = %s", (ticket_id,))
-        ticket = cursor.fetchone()
-        
-        if not ticket:
-            raise HTTPException(status_code=404, detail="Ticket not found")
-        if user_role not in ['ADMIN', 'SUPPORT'] and str(ticket['buyer_id']) != str(user['user_id']):
-            raise HTTPException(status_code=403, detail="Unauthorized")
-        if ticket['status'] == 'CLOSED':
-            raise HTTPException(status_code=400, detail="Cannot reply to a closed ticket.")
+async def add_ticket_message(ticket_id: str, req: MessageCreate, user: dict = Depends(get_current_user), db: AsyncSession = Depends(get_db)):
+    user_role = str(user.get('role', '')).upper()
+    
+    ticket = (await db.execute(select(SupportTicket).where(SupportTicket.id == ticket_id))).scalar_one_or_none()
+    if not ticket:
+        raise HTTPException(status_code=404)
+    if ticket.status == 'CLOSED':
+        raise HTTPException(status_code=400, detail="Ticket closed.")
 
-        new_status = 'OPEN' if user_role not in ['ADMIN', 'SUPPORT'] else 'WAITING_ON_CUSTOMER'
-        if req.is_internal_note:
-            new_status = ticket['status'] 
-            if user_role not in ['ADMIN', 'SUPPORT']:
-                raise HTTPException(status_code=403, detail="Buyers cannot post internal notes")
+    new_status = ticket.status if req.is_internal_note else ('OPEN' if user_role not in ['ADMIN', 'SUPPORT'] else 'WAITING_ON_CUSTOMER')
+    msg_id = str(uuid.uuid4())
+    
+    new_message = TicketMessage(
+        id=msg_id, ticket_id=ticket_id, sender_id=user['user_id'], 
+        message=req.message, is_internal_note=req.is_internal_note, attachments=req.attachments
+    )
+    ticket.status = new_status
+    ticket.updated_at = datetime.utcnow()
+    
+    db.add(new_message)
+    await db.commit()
 
-        cursor.execute("""
-            INSERT INTO ticket_messages (id, ticket_id, sender_id, message, is_internal_note, is_read)
-            VALUES (%s, %s, %s, %s, %s, FALSE)
-        """, (str(uuid.uuid4()), ticket_id, user['user_id'], req.message, req.is_internal_note))
-        
-        cursor.execute("UPDATE support_tickets SET status = %s, updated_at = CURRENT_TIMESTAMP WHERE id = %s", (new_status, ticket_id))
-        
-        # Clear typing indicator immediately after sending
-        if ticket_id in typing_cache and user['user_id'] in typing_cache[ticket_id]:
-            typing_cache[ticket_id].pop(user['user_id'], None)
+    # Broadcast directly through Redis
+    sender_name = "Support Team" if user_role in ['ADMIN', 'SUPPORT'] else "Buyer"
+    await manager.broadcast(ticket_id, {
+        "type": "NEW_MESSAGE",
+        "message": {
+            "id": msg_id,
+            "ticket_id": ticket_id,
+            "sender_id": user['user_id'],
+            "sender_name": sender_name,
+            "sender_role": user_role,
+            "message": req.message,
+            "is_internal_note": req.is_internal_note,
+            "is_read": False,
+            "attachments": req.attachments,
+            "created_at": datetime.utcnow().isoformat() + "Z"
+        }
+    })
+    return {"status": "success"}
 
-        conn.commit()
-        return {"status": "success"}
-    except Exception as e:
-        conn.rollback()
-        raise HTTPException(status_code=500, detail=str(e))
-    finally:
-        cursor.close()
-        conn.close()
-
-# Polling endpoint for typing indicator
+# Fallback HTTP Polling
 @router.post("/api/support/tickets/{ticket_id}/typing")
-def update_typing(ticket_id: str, req: TypingUpdate, user: dict = Depends(get_current_user)):
-    if ticket_id not in typing_cache:
-        typing_cache[ticket_id] = {}
-        
-    if req.is_typing:
-        typing_cache[ticket_id][user['user_id']] = datetime.now()
-    else:
-        typing_cache[ticket_id].pop(user['user_id'], None)
-        
+async def update_typing(ticket_id: str, req: TypingUpdate, user: dict = Depends(get_current_user)):
+    user_role = str(user.get('role', '')).upper()
+    sender_name = "Support Team" if user_role in ['ADMIN', 'SUPPORT'] else "Buyer"
+    
+    await manager.broadcast(ticket_id, {
+        "type": "TYPING",
+        "user_id": user['user_id'],
+        "is_typing": req.is_typing,
+        "sender_name": sender_name
+    })
     return {"status": "ok"}
 
 @router.patch("/api/support/tickets/{ticket_id}")
-def update_ticket(ticket_id: str, req: TicketUpdate, user: dict = Depends(get_current_user)):
-    conn = get_db_connection()
-    cursor = conn.cursor(cursor_factory=RealDictCursor)
-    try:
-        user_role = str(user.get('role', '')).upper()
-        
-        cursor.execute("SELECT buyer_id, status FROM support_tickets WHERE id = %s", (ticket_id,))
-        ticket = cursor.fetchone()
-        
-        if not ticket:
-            raise HTTPException(status_code=404, detail="Ticket not found")
+async def update_ticket(ticket_id: str, req: TicketUpdate, user: dict = Depends(get_current_user), db: AsyncSession = Depends(get_db)):
+    user_role = str(user.get('role', '')).upper()
+    
+    ticket = (await db.execute(select(SupportTicket).where(SupportTicket.id == ticket_id))).scalar_one_or_none()
+    if not ticket:
+        raise HTTPException(status_code=404)
 
-        if user_role not in ['ADMIN', 'SUPPORT']:
-            if str(ticket['buyer_id']) != str(user['user_id']):
-                raise HTTPException(status_code=403, detail="Unauthorized")
-            if req.status and req.status != 'CLOSED':
-                raise HTTPException(status_code=403, detail="Buyers can only close tickets.")
-            if req.assigned_agent_id:
-                raise HTTPException(status_code=403, detail="Buyers cannot assign agents.")
-
-        update_fields = []
-        params = []
-        if req.status:
-            update_fields.append("status = %s")
-            params.append(req.status)
+    if user_role not in ['ADMIN', 'SUPPORT']:
+        if str(ticket.buyer_id) != str(user['user_id']):
+            raise HTTPException(status_code=403, detail="Unauthorized")
+        if req.status and req.status != 'CLOSED':
+            raise HTTPException(status_code=403, detail="Buyers can only close tickets.")
         if req.assigned_agent_id:
-            update_fields.append("assigned_agent_id = %s")
-            params.append(req.assigned_agent_id)
-            if ticket['status'] == 'OPEN':
-                update_fields.append("status = 'IN_PROGRESS'")
+            raise HTTPException(status_code=403, detail="Buyers cannot assign agents.")
 
-        if not update_fields:
-            return {"status": "success", "message": "No changes requested"}
-
-        update_fields.append("updated_at = CURRENT_TIMESTAMP")
-        params.append(ticket_id)
+    if req.status: ticket.status = req.status
+    if req.assigned_agent_id: 
+        ticket.assigned_agent_id = req.assigned_agent_id
+        if ticket.status == 'OPEN': ticket.status = 'IN_PROGRESS'
         
-        query = f"UPDATE support_tickets SET {', '.join(update_fields)} WHERE id = %s"
-        cursor.execute(query, tuple(params))
+    ticket.updated_at = datetime.utcnow()
+    
+    if req.status == 'RESOLVED':
+        db.add(TicketMessage(
+            id=str(uuid.uuid4()), ticket_id=ticket_id, sender_id=user['user_id'], 
+            message="System: Ticket marked as RESOLVED.", is_internal_note=True, attachments=[]
+        ))
         
-        if req.status == 'RESOLVED':
-            msg = "System: Ticket marked as RESOLVED."
-            cursor.execute("INSERT INTO ticket_messages (id, ticket_id, sender_id, message, is_internal_note) VALUES (%s, %s, %s, %s, TRUE)", 
-                          (str(uuid.uuid4()), ticket_id, user['user_id'], msg))
-                          
-        conn.commit()
-        return {"status": "success"}
-    except Exception as e:
-        conn.rollback()
-        raise HTTPException(status_code=500, detail=str(e))
-    finally:
-        cursor.close()
-        conn.close()
+    await db.commit()
+    return {"status": "success"}
