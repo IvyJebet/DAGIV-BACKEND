@@ -16,7 +16,7 @@ from dotenv import load_dotenv
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
 from sqlalchemy.orm import declarative_base, sessionmaker
 from sqlalchemy import Column, String, Boolean, DateTime, select, func, update
-from sqlalchemy.dialects.postgresql import JSONB
+from sqlalchemy.dialects.postgresql import JSONB, UUID
 import redis.asyncio as aioredis
 
 load_dotenv()
@@ -43,7 +43,14 @@ elif raw_db_url.startswith("postgres://"):
 else:
     async_db_url = raw_db_url
 
-engine = create_async_engine(async_db_url, echo=False)
+# Remove the psycopg2-specific 'sslmode' argument that crashes asyncpg
+async_db_url = async_db_url.replace("?sslmode=require", "").replace("&sslmode=require", "")
+
+engine = create_async_engine(
+    async_db_url, 
+    echo=False, 
+    connect_args={"statement_cache_size": 0} # Disables cache to bypass PgBouncer limitations
+)
 AsyncSessionLocal = sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
 
 # Setup Redis for WebSockets
@@ -82,15 +89,15 @@ Base = declarative_base()
 
 class User(Base):
     __tablename__ = 'users'
-    id = Column(String, primary_key=True)
+    id = Column(UUID(as_uuid=False), primary_key=True)
     username = Column(String)
     role = Column(String)
 
 class SupportTicket(Base):
     __tablename__ = 'support_tickets'
     id = Column(String, primary_key=True)
-    buyer_id = Column(String)
-    assigned_agent_id = Column(String, nullable=True)
+    buyer_id = Column(UUID(as_uuid=False))
+    assigned_agent_id = Column(UUID(as_uuid=False), nullable=True)
     subject = Column(String)
     category = Column(String)
     priority = Column(String)
@@ -100,9 +107,9 @@ class SupportTicket(Base):
 
 class TicketMessage(Base):
     __tablename__ = 'ticket_messages'
-    id = Column(String, primary_key=True)
+    id = Column(UUID(as_uuid=False), primary_key=True)
     ticket_id = Column(String)
-    sender_id = Column(String)
+    sender_id = Column(UUID(as_uuid=False))
     message = Column(String)
     is_internal_note = Column(Boolean, default=False)
     is_read = Column(Boolean, default=False)
@@ -127,7 +134,6 @@ class ConnectionManager:
             self.active_connections[ticket_id].remove(websocket)
 
     async def broadcast(self, ticket_id: str, message: dict):
-        # Publish globally via Redis instead of just local worker
         await redis_client.publish(f"ticket_{ticket_id}", json.dumps(message))
 
 manager = ConnectionManager()
@@ -153,7 +159,6 @@ router = APIRouter()
 
 @router.on_event("startup")
 async def startup_event():
-    # Start Redis listener on server boot
     asyncio.create_task(redis_listener())
 
 # =====================================================================
@@ -201,7 +206,7 @@ async def get_upload_url(file_name: str, file_type: str, user: dict = Depends(ge
         raise HTTPException(status_code=500, detail=str(e))
 
 @router.websocket("/api/support/tickets/{ticket_id}/ws")
-async def websocket_endpoint(websocket: WebSocket, ticket_id: str, token: str):
+async def websocket_endpoint(websocket: WebSocket, ticket_id: str, token: str, db: AsyncSession = Depends(get_db)):
     try:
         user = await get_current_user(token)
         await manager.connect(websocket, ticket_id)
@@ -213,6 +218,22 @@ async def websocket_endpoint(websocket: WebSocket, ticket_id: str, token: str):
                     "user_id": user['user_id'],
                     "is_typing": data.get("is_typing", False),
                     "sender_name": "Support Team" if user.get('role', '').upper() in ['ADMIN', 'SUPPORT'] else "Buyer"
+                })
+            # FIX: Real-time Read Receipts
+            elif data.get("type") == "MARK_READ":
+                # 1. Update DB instantly
+                await db.execute(
+                    update(TicketMessage).where(
+                        TicketMessage.ticket_id == ticket_id, 
+                        TicketMessage.sender_id != user['user_id'], 
+                        TicketMessage.is_read == False
+                    ).values(is_read=True)
+                )
+                await db.commit()
+                # 2. Tell the other person's browser to turn the ticks blue!
+                await manager.broadcast(ticket_id, {
+                    "type": "READ_RECEIPT",
+                    "user_id": user['user_id']
                 })
     except WebSocketDisconnect:
         manager.disconnect(websocket, ticket_id)

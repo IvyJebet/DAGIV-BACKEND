@@ -233,6 +233,16 @@ class WithdrawRequest(BaseModel):
     method: str  # e.g., 'MPESA' or 'BANK'
     account_alias: str  # phone number or bank account number
     bank_name: Optional[str] = None
+
+class SourcingRequest(BaseModel):
+    equipment_type: str
+    brand_preference: str
+    condition: str
+    budget: float
+    currency: str = "KES"
+    timeline: str
+    description: str
+
 # --- 3. NOTIFICATION SYSTEM (SYNC & ASYNC) ---
 
 def send_email_alert(category: str, details: str):
@@ -444,139 +454,255 @@ async def get_current_user(token: str = Depends(oauth2_scheme)):
 
 def require_role(required_role: str):
     def role_checker(user = Depends(get_current_user)):
-        if user["role"] != required_role and user["role"] != "ADMIN":
+        # Safely convert both to uppercase for a foolproof comparison
+        user_role = str(user.get("role", "")).upper()
+        req_role = required_role.upper()
+        
+        if user_role != req_role and user_role != "ADMIN":
             raise HTTPException(status_code=403, detail=f"Access denied. Requires {required_role}")
         return user
     return role_checker
 
 def draw_enterprise_pdf(p, title, doc_id, user, items, total_amount, currency, status, is_quotation=False):
-    """Helper function to draw the enterprise-grade PDF layout"""
+    """Generates an Enterprise-Grade Commercial PDF Invoice / ETR"""
     width, height = letter
+    margin = 40
     
-    # 1. WATERMARK
+    # --- 1. DYNAMIC WATERMARK ---
     p.saveState()
     p.translate(width / 2, height / 2)
     p.rotate(45)
-    p.setFont("Helvetica-Bold", 80)
-    p.setFillColor(colors.Color(0.9, 0.9, 0.9, alpha=0.5)) # Light gray, transparent
-    watermark_text = "PROFORMA QUOTATION" if is_quotation else ("PAID IN FULL" if status in ['FUNDS_SECURED', 'RELEASED', 'DELIVERED', 'IN_TRANSIT'] else "PENDING PAYMENT")
+    p.setFont("Helvetica-Bold", 70)
+    p.setFillColor(colors.Color(0.95, 0.95, 0.95, alpha=0.35)) 
+    watermark_text = "PROFORMA QUOTE" if is_quotation else ("PAID IN FULL" if status in ['FUNDS_SECURED', 'RELEASED', 'DELIVERED', 'IN_TRANSIT'] else "PAYMENT PENDING")
     p.drawCentredString(0, 0, watermark_text)
     p.restoreState()
 
-    # 2. HEADER
-    p.setFont("Helvetica-Bold", 28)
-    p.setFillColor(colors.HexColor("#eab308")) # DAGIV Yellow
-    p.drawString(50, height - 60, "DAGIV")
+    # --- 2. DAGIV CORPORATE HEADER ---
+    # Adjusted font sizes to prevent overlapping with the document title
+    p.setFont("Helvetica-Bold", 26)
+    p.setFillColor(colors.HexColor("#DD9C00")) # Harvest Gold
+    p.drawString(margin, height - 55, "DAGIV")
     p.setFillColor(colors.HexColor("#0f172a")) # Slate
-    p.drawString(140, height - 60, "ENGINEERING")
+    p.drawString(130, height - 55, "ENGINEERING")
     
-    p.setFont("Helvetica-Bold", 16)
-    p.drawRightString(width - 50, height - 50, title)
-    p.setFont("Helvetica", 10)
-    p.drawRightString(width - 50, height - 65, f"Ref: {doc_id}")
-    p.drawRightString(width - 50, height - 80, f"Date: {datetime.now().strftime('%d %b %Y, %H:%M')}")
+    p.setFont("Helvetica-Bold", 7)
+    p.setFillColor(colors.HexColor("#64748b"))
+    p.drawString(margin + 2, height - 68, "HEAVY MACHINERY • SPARE PARTS • LOGISTICS")
 
-    # 3. COMPANY & KRA DETAILS (Left)
-    p.setFont("Helvetica-Bold", 10)
-    p.drawString(50, height - 100, "FROM (MERCHANT OF RECORD):")
-    p.setFont("Helvetica", 10)
-    p.drawString(50, height - 115, "DAGIV Engineering Ltd.")
-    p.drawString(50, height - 130, "Industrial Area, Enterprise Rd, Nairobi")
-    p.drawString(50, height - 145, "KRA PIN: P051234567Z") # Replace with actual
-    p.drawString(50, height - 160, "Email: billing@dagiv.co.ke")
-
-    # 4. BUYER DETAILS (Right)
-    p.setFont("Helvetica-Bold", 10)
-    p.drawString(350, height - 100, "BILL TO:")
-    p.setFont("Helvetica", 10)
-    p.drawString(350, height - 115, f"Customer: {user.get('username', 'Guest').upper()}")
-    p.drawString(350, height - 130, f"Account ID: {user.get('user_id', 'N/A')[:8]}")
-    
-    # 5. LINE ITEMS TABLE HEADER
-    y = height - 210
-    p.setFont("Helvetica-Bold", 10)
+    # --- 3. DOCUMENT METADATA (Top Right) ---
+    p.setFont("Helvetica-Bold", 18)
     p.setFillColor(colors.HexColor("#0f172a"))
-    p.rect(50, y-8, width-100, 22, fill=1)
-    p.setFillColor(colors.white)
-    p.drawString(60, y, "Item Description")
-    p.drawString(250, y, "Supplier")
-    p.drawString(380, y, "Qty")
-    p.drawString(430, y, "Unit Price")
-    p.drawString(500, y, "Total")
+    p.drawRightString(width - margin, height - 55, title.upper())
     
-    # 6. LINE ITEMS
-    y -= 25
+    p.setFont("Helvetica-Bold", 9)
+    p.setFillColor(colors.HexColor("#64748b"))
+    p.drawRightString(width - 130, height - 75, "Document No:")
+    p.drawRightString(width - 130, height - 90, "Issue Date:")
+    if is_quotation:
+        p.drawRightString(width - 130, height - 105, "Valid Until:")
+    else:
+        p.drawRightString(width - 130, height - 105, "Payment Status:")
+
     p.setFont("Helvetica", 9)
     p.setFillColor(colors.black)
+    p.drawRightString(width - margin, height - 75, doc_id)
+    p.drawRightString(width - margin, height - 90, datetime.now().strftime('%d %b %Y'))
     
+    if is_quotation:
+        valid_date = (datetime.now() + timedelta(days=14)).strftime('%d %b %Y')
+        p.drawRightString(width - margin, height - 105, valid_date)
+    else:
+        if status in ['FUNDS_SECURED', 'RELEASED', 'DELIVERED', 'IN_TRANSIT']:
+            p.setFillColor(colors.HexColor("#16a34a")) # Green
+        else:
+            p.setFillColor(colors.HexColor("#ea580c")) # Orange
+        p.drawRightString(width - margin, height - 105, status.replace('_', ' '))
+
+    # --- 4. ADDRESS BLOCKS ---
+    y_info = height - 140
+    box_width = (width - (margin * 2) - 20) / 2
+
+    # Left Box: Merchant of Record
+    p.setStrokeColor(colors.HexColor("#e2e8f0"))
+    p.setFillColor(colors.HexColor("#f8fafc"))
+    p.roundRect(margin, y_info - 85, box_width, 85, 6, stroke=1, fill=1)
+    
+    p.setFont("Helvetica-Bold", 8)
+    p.setFillColor(colors.HexColor("#64748b"))
+    p.drawString(margin + 15, y_info - 15, "MERCHANT OF RECORD:")
+    p.setFont("Helvetica-Bold", 10)
+    p.setFillColor(colors.HexColor("#0f172a"))
+    p.drawString(margin + 15, y_info - 32, "DAGIV Engineering Ltd.")
+    p.setFont("Helvetica", 9)
+    p.setFillColor(colors.black)
+    p.drawString(margin + 15, y_info - 47, "Industrial Area, Enterprise Rd, Nairobi")
+    p.drawString(margin + 15, y_info - 62, "KRA PIN: P051234567Z") 
+    p.drawString(margin + 15, y_info - 77, "Email: dagivengineering@gmail.com")
+
+    # Right Box: Buyer Details
+    p.setFillColor(colors.white)
+    p.roundRect(width - margin - box_width, y_info - 85, box_width, 85, 6, stroke=1, fill=1)
+    
+    p.setFont("Helvetica-Bold", 8)
+    p.setFillColor(colors.HexColor("#64748b"))
+    p.drawString(width - margin - box_width + 15, y_info - 15, "BILL TO / BUYER:")
+    p.setFont("Helvetica-Bold", 10)
+    p.setFillColor(colors.HexColor("#0f172a"))
+    
+    buyer_name = user.get('username', 'Valued Client').upper()
+    buyer_phone = user.get('phone', 'N/A')
+    buyer_email = user.get('email', 'N/A')
+    
+    p.drawString(width - margin - box_width + 15, y_info - 32, buyer_name)
+    p.setFont("Helvetica", 9)
+    p.setFillColor(colors.black)
+    p.drawString(width - margin - box_width + 15, y_info - 47, f"Phone: {buyer_phone}")
+    p.drawString(width - margin - box_width + 15, y_info - 62, f"Email: {buyer_email}")
+    p.drawString(width - margin - box_width + 15, y_info - 77, f"Account ID: {user.get('user_id', 'N/A')[:8].upper()}")
+
+    # --- 5. LINE ITEMS TABLE HEADER ---
+    y = height - 250
+    p.setFillColor(colors.HexColor("#0f172a"))
+    p.roundRect(margin, y-10, width-(margin*2), 25, 4, stroke=0, fill=1)
+    
+    p.setFont("Helvetica-Bold", 8)
+    p.setFillColor(colors.white)
+    p.drawString(margin + 10, y - 3, "#")
+    p.drawString(margin + 35, y - 3, "ITEM DESCRIPTION & SUPPLIER")
+    p.drawCentredString(360, y - 3, "QTY")
+    p.drawRightString(450, y - 3, "UNIT PRICE")
+    p.drawRightString(width - margin - 10, y - 3, "TOTAL")
+    
+    # --- 6. LINE ITEMS (With Zebra Striping & Actual Seller Emails) ---
+    y -= 25
     subtotal = 0
-    for item in items:
+    
+    for idx, item in enumerate(items):
+        if y < 220: # Safe page break protection
+            p.showPage()
+            y = height - 50
+            
+        if idx % 2 == 0:
+            p.setFillColor(colors.HexColor("#f8fafc"))
+            p.rect(margin, y-20, width-(margin*2), 35, stroke=0, fill=1)
+
         desc = f"{item.get('brand', '')} {item.get('model', '')}"
-        supplier = item.get('seller_name', 'Verified Supplier')
+        supplier = item.get('seller_name', 'DAGIV Verified Partner')
+        seller_email = item.get('seller_email', 'Contact via Platform')
+        
         qty = item.get('quantity', 1)
         u_price = item.get('unit_price') or item.get('price', 0)
         item_tot = u_price * qty
         subtotal += item_tot
         
-        p.drawString(60, y, desc[:35])
-        p.drawString(250, y, supplier[:20])
-        p.drawString(380, y, str(qty))
-        p.drawString(430, y, f"{u_price:,.2f}")
-        p.drawString(500, y, f"{item_tot:,.2f}")
-        y -= 20
-        p.setStrokeColor(colors.lightgrey)
-        p.line(50, y+10, width-50, y+10)
+        p.setFillColor(colors.black)
+        p.setFont("Helvetica", 9)
+        p.drawString(margin + 10, y, str(idx + 1))
+        
+        # Item Name
+        p.setFont("Helvetica-Bold", 9)
+        p.drawString(margin + 35, y, desc[:45])
+        
+        # Supplier Subtext (Includes their real registered email)
+        p.setFont("Helvetica-Oblique", 7)
+        p.setFillColor(colors.HexColor("#64748b"))
+        p.drawString(margin + 35, y - 12, f"Fulfillment By: {supplier[:30]} | {seller_email}")
+        
+        p.setFont("Helvetica", 9)
+        p.setFillColor(colors.black)
+        p.drawCentredString(360, y, str(qty))
+        p.drawRightString(450, y, f"{u_price:,.2f}")
+        p.setFont("Helvetica-Bold", 9)
+        p.drawRightString(width - margin - 10, y, f"{item_tot:,.2f}")
+        
+        y -= 35
 
-    # 7. TOTALS & TAX CALCULATIONS (Assuming prices are VAT inclusive for this example)
+    # --- 7. TOTALS & TAX CALCULATIONS ---
+    y -= 10
+    p.setStrokeColor(colors.HexColor("#cbd5e1"))
+    p.line(width/2 + 50, y+15, width-margin, y+15)
+
     vat_rate = 0.16
+    escrow_fee = subtotal * 0.015
+    grand_total = subtotal + escrow_fee
     subtotal_ex_vat = subtotal / (1 + vat_rate)
     vat_amount = subtotal - subtotal_ex_vat
 
-    y -= 20
-    p.setFont("Helvetica", 10)
-    p.drawRightString(480, y, "Subtotal (Excl. VAT):")
-    p.drawRightString(width - 50, y, f"{currency} {subtotal_ex_vat:,.2f}")
-    
-    y -= 15
-    p.drawRightString(480, y, "VAT (16%):")
-    p.drawRightString(width - 50, y, f"{currency} {vat_amount:,.2f}")
+    # Increased offset from 100 to 160 to prevent string collision
+    label_offset = 160
 
-    y -= 20
-    p.setFont("Helvetica-Bold", 12)
-    p.setFillColor(colors.HexColor("#16a34a")) if not is_quotation else p.setFillColor(colors.HexColor("#ea580c"))
-    p.drawRightString(480, y, "GRAND TOTAL:")
-    p.drawRightString(width - 50, y, f"{currency} {subtotal:,.2f}")
-
-    # 8. ETR & PAYMENT TERMS (Footer area)
-    y -= 50
+    p.setFont("Helvetica", 9)
+    p.setFillColor(colors.HexColor("#475569"))
+    p.drawRightString(width - margin - label_offset, y, "Subtotal (Excl. VAT):")
     p.setFillColor(colors.black)
-    p.setFont("Helvetica-Bold", 9)
-    p.drawString(50, y, "PAYMENT INSTRUCTIONS & TERMS:")
-    p.setFont("Helvetica", 8)
-    p.drawString(50, y-15, "All payments are held securely in DAGIV Escrow until delivery is confirmed.")
-    if is_quotation:
-        p.drawString(50, y-30, "This is a Quotation. Prices are valid for 14 days from the date of issue.")
-    else:
-        p.drawString(50, y-30, f"Payment Method: Escrow Gateway | Status: {status.replace('_', ' ')}")
+    p.drawRightString(width - margin - 10, y, f"{currency} {subtotal_ex_vat:,.2f}")
     
-    # 9. KRA ETR SECTION
-    p.setFont("Helvetica-Bold", 8)
-    p.drawString(50, 70, "------------------------------------------------------")
-    p.drawString(50, 60, "KRA ETR RECEIPT DETAILS")
-    p.setFont("Helvetica", 7)
-    p.drawString(50, 50, f"CUIN: DAGIV-{uuid.uuid4().hex[:10].upper()}")
-    p.drawString(50, 40, f"Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-    p.drawString(50, 30, "This serves as a valid electronic tax receipt.")
+    y -= 18
+    p.setFillColor(colors.HexColor("#475569"))
+    p.drawRightString(width - margin - label_offset, y, "VAT (16%):")
+    p.setFillColor(colors.black)
+    p.drawRightString(width - margin - 10, y, f"{currency} {vat_amount:,.2f}")
 
-    # 10. QR CODE (Scannable verification)
-    qr_data = f"DAGIV|{doc_id}|{currency}{subtotal:,.2f}|{status}"
+    y -= 18
+    p.setFillColor(colors.HexColor("#475569"))
+    p.drawRightString(width - margin - label_offset, y, "Platform Escrow Fee (1.5%):")
+    p.setFillColor(colors.black)
+    p.drawRightString(width - margin - 10, y, f"{currency} {escrow_fee:,.2f}")
+
+    y -= 25
+    p.setFont("Helvetica-Bold", 12)
+    p.setFillColor(colors.HexColor("#0f172a"))
+    p.drawRightString(width - margin - label_offset, y, "GRAND TOTAL:")
+    
+    p.setFillColor(colors.HexColor("#16a34a")) if not is_quotation else p.setFillColor(colors.HexColor("#ea580c"))
+    p.drawRightString(width - margin - 10, y, f"{currency} {grand_total:,.2f}")
+
+    # --- 8. PAYMENT INSTRUCTIONS (For Quotes) ---
+    y_footer = 140
+    if is_quotation:
+        p.setFillColor(colors.HexColor("#fffbeb")) # Light amber
+        p.setStrokeColor(colors.HexColor("#fde68a"))
+        p.roundRect(margin, y_footer - 15, 320, 60, 4, stroke=1, fill=1)
+        
+        p.setFillColor(colors.HexColor("#b45309"))
+        p.setFont("Helvetica-Bold", 8)
+        p.drawString(margin + 10, y_footer + 25, "HOW TO SECURE THESE ASSETS:")
+        p.setFont("Helvetica", 8)
+        p.setFillColor(colors.black)
+        p.drawString(margin + 10, y_footer + 10, "Deposit funds to the DAGIV Engineering Account to begin dispatch.")
+        p.drawString(margin + 10, y_footer - 5, "Bank: KCB Bank Kenya  |  Branch: Industrial Area")
+        p.setFont("Helvetica-Bold", 8)
+        p.drawString(margin + 10, y_footer - 20, f"Account Name: DAGIV Engineering | Acc No: 1280877812")
+    
+    # --- 9. KRA ETR / VERIFICATION BLOCK ---
+    y_etr = 70
+    p.setFillColor(colors.HexColor("#f8fafc"))
+    p.setStrokeColor(colors.HexColor("#e2e8f0"))
+    p.roundRect(margin, y_etr - 40, width-(margin*2), 65, 4, stroke=1, fill=1)
+    
+    p.setFillColor(colors.HexColor("#0f172a"))
+    p.setFont("Helvetica-Bold", 9)
+    p.drawString(margin + 15, y_etr + 5, "OFFICIAL KRA ETR RECEIPT" if not is_quotation else "DAGIV SYSTEM GENERATED QUOTATION")
+    
+    p.setFont("Helvetica", 7)
+    p.setFillColor(colors.HexColor("#475569"))
+    cuin = f"DAGIV-{uuid.uuid4().hex[:12].upper()}"
+    timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    p.drawString(margin + 15, y_etr - 10, f"Control Unit ID (CUIN): {cuin}")
+    p.drawString(margin + 15, y_etr - 22, f"Date/Time of Issue: {timestamp}")
+    p.drawString(margin + 15, y_etr - 34, "This is a valid electronic receipt generated via the DAGIV Escrow System.")
+
+    # 10. QR CODE for authenticity
+    qr_data = f"DAGIV|{doc_id}|{currency}{grand_total:,.2f}|{cuin}"
     qr_code = qr.QrCodeWidget(qr_data)
     bounds = qr_code.getBounds()
     qr_width = bounds[2] - bounds[0]
     qr_height = bounds[3] - bounds[1]
-    d = Drawing(60, 60, transform=[60/qr_width, 0, 0, 60/qr_height, 0, 0])
+    
+    d = Drawing(50, 50, transform=[50/qr_width, 0, 0, 50/qr_height, 0, 0])
     d.add(qr_code)
-    renderPDF.draw(d, p, width - 110, 30)
+    renderPDF.draw(d, p, width - margin - 60, y_etr - 35)
 
     p.save()
     return
@@ -699,6 +825,22 @@ def startup_db():
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     ''')
+
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS sourcing_requests (
+            id TEXT PRIMARY KEY,
+            buyer_id TEXT,
+            equipment_type TEXT,
+            brand_preference TEXT,
+            condition TEXT,
+            budget REAL,
+            currency TEXT DEFAULT 'KES',
+            timeline TEXT,
+            description TEXT,
+            status TEXT DEFAULT 'PENDING_REVIEW',
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
     
     # 6. Migrations (Self-Healing)
     try:
@@ -1028,9 +1170,10 @@ def generate_cart_quotation(user: dict = Depends(get_current_user)):
     try:
         # Fetch cart items
         cursor.execute("""
-            SELECT c.quantity, l.brand, l.model, l.price as unit_price, l.seller_name, l.currency
+            SELECT c.quantity, l.brand, l.model, l.price as unit_price, l.seller_name, l.currency, u.email as seller_email
             FROM cart_items c
             JOIN marketplace_listings l ON c.listing_id = l.id
+            LEFT JOIN users u ON l.phone = u.phone
             WHERE c.user_id = %s
         """, (user['user_id'],))
         items = cursor.fetchall()
@@ -1039,7 +1182,7 @@ def generate_cart_quotation(user: dict = Depends(get_current_user)):
             raise HTTPException(status_code=400, detail="Cart is empty. Cannot generate quotation.")
 
         # Fetch user details
-        cursor.execute("SELECT username, email FROM users WHERE id = %s", (user['user_id'],))
+        cursor.execute("SELECT username, email, phone FROM users WHERE id = %s", (user['user_id'],))
         user_info = cursor.fetchone()
         user.update(user_info)
 
@@ -1161,15 +1304,17 @@ def generate_invoice(order_id: str, user: dict = Depends(get_current_user)):
         if not order:
             raise HTTPException(status_code=404, detail="Order not found")
 
+        # Fetch order items AND the seller's registered email
         cursor.execute("""
-            SELECT li.quantity, li.unit_price, m.brand, m.model, m.seller_name
+            SELECT li.quantity, li.unit_price, m.brand, m.model, m.seller_name, u.email as seller_email
             FROM order_line_items li
             JOIN marketplace_listings m ON li.listing_id = m.id
+            LEFT JOIN users u ON li.seller_phone = u.phone
             WHERE li.order_id = %s
         """, (order_id,))
         items = cursor.fetchall()
 
-        cursor.execute("SELECT username, email FROM users WHERE id = %s", (user['user_id'],))
+        cursor.execute("SELECT username, email, phone FROM users WHERE id = %s", (user['user_id'],))
         user_info = cursor.fetchone()
         user.update(user_info)
 
@@ -1678,7 +1823,7 @@ def process_checkout(req: CheckoutProcessRequest, background_tasks: BackgroundTa
         elif req.payment_method == 'BANK':
             payment_info = {
                 "type": "BANK",
-                "message": "Please transfer funds to the DAGIV Escrow Account below.",
+                "message": "Please transfer funds to the DAGIV Engineering Account below.",
                 "bank": "KCB Bank Kenya",
                 "account_name": "DAGIV Engineering Ltd",
                 "account_number": "1280877812",
@@ -2013,6 +2158,70 @@ def simulate_order_flow(order_id: str, background_tasks: BackgroundTasks):
         return {"status": "success", "message": "Order is already at RELEASED. Funds are securely in the Available Balance."}
     finally:
         conn.close()
+
+@app.get("/api/admin/users")
+def get_all_users(user: dict = Depends(get_current_user)):
+    """Fetches all users and sellers for the Admin Dashboard."""
+    
+    # Enforce Staff-Only Access (Case Insensitive)
+    user_role = str(user.get('role', '')).upper()
+    if user_role not in ['ADMIN', 'SUPPORT']:
+        raise HTTPException(status_code=403, detail="Access denied. Staff only.")
+        
+    conn = get_db_connection()
+    cursor = conn.cursor(cursor_factory=RealDictCursor)
+    try:
+        # Fetch standard users (Buyers, Agents, Admins)
+        cursor.execute("""
+            SELECT id, username, email, role, is_verified, created_at 
+            FROM users 
+            WHERE role != 'SELLER'
+            ORDER BY created_at DESC
+        """)
+        standard_users = cursor.fetchall()
+
+        # Fetch Sellers (Joining with the sellers table for KYC status)
+        cursor.execute("""
+            SELECT u.id, u.username, u.email, u.role, u.created_at, 
+                   s.status as seller_status
+            FROM users u
+            JOIN sellers s ON u.phone = s.phone
+            WHERE u.role = 'SELLER'
+            ORDER BY u.created_at DESC
+        """)
+        sellers = cursor.fetchall()
+
+        formatted_users = []
+        
+        # Format standard users
+        for u in standard_users:
+            status = 'ACTIVE' if u['is_verified'] else 'PENDING'
+            formatted_users.append({
+                "id": str(u['id']),
+                "username": u['username'] or "Unknown",
+                "email": u['email'] or "No Email",
+                "role": str(u['role']).upper(),
+                "status": status,
+                "joined": u['created_at'].strftime("%Y-%m-%d") if u['created_at'] else "Unknown"
+            })
+            
+        # Format sellers with their specific KYC status
+        for s in sellers:
+            formatted_users.append({
+                "id": str(s['id']),
+                "username": s['username'] or "Unknown",
+                "email": s['email'] or "No Email",
+                "role": "SELLER",
+                "status": str(s['seller_status']).upper() if s['seller_status'] else "PENDING",
+                "joined": s['created_at'].strftime("%Y-%m-%d") if s['created_at'] else "Unknown"
+            })
+
+        return formatted_users
+    except Exception as e:
+        print(f"Error fetching admin users: {e}")
+        raise HTTPException(status_code=500, detail="Failed to fetch users")
+    finally:
+        conn.close()
         
 @app.post("/api/wallet/withdraw")
 def request_withdrawal(req: WithdrawRequest, background_tasks: BackgroundTasks, user: dict = Depends(require_role("SELLER"))):
@@ -2068,5 +2277,83 @@ def request_withdrawal(req: WithdrawRequest, background_tasks: BackgroundTasks, 
     finally:
         cursor.close()
         conn.close()
+
+@app.post("/api/sourcing-requests")
+def create_sourcing_request(req: SourcingRequest, background_tasks: BackgroundTasks, user: dict = Depends(get_current_user)):
+    conn = get_db_connection()
+    cursor = conn.cursor(cursor_factory=RealDictCursor)
+    try:
+        # 1. Fetch the Buyer's actual registered details from the database
+        cursor.execute("SELECT username, email, phone FROM users WHERE id = %s", (user['user_id'],))
+        buyer_data = cursor.fetchone()
+        
+        if not buyer_data:
+            raise HTTPException(status_code=404, detail="Buyer profile not found.")
+            
+        buyer_name = buyer_data['username']
+        buyer_email = buyer_data['email']
+        buyer_phone = buyer_data['phone']
+
+        # 2. Generate ID and log it securely to the database
+        request_id = f"SRC-{uuid.uuid4().hex[:8].upper()}"
+        cursor.execute("""
+            INSERT INTO sourcing_requests (id, buyer_id, equipment_type, brand_preference, condition, budget, currency, timeline, description)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+        """, (request_id, user['user_id'], req.equipment_type, req.brand_preference, req.condition, req.budget, req.currency, req.timeline, req.description))
+        
+        conn.commit()
+        
+        # 3. Build a beautiful, professional HTML email for the DAGIV Team
+        email_html = f"""
+        <div style="font-family: Arial, sans-serif; max-width: 600px; border: 1px solid #e2e8f0; border-radius: 8px; overflow: hidden;">
+            <div style="background-color: #0f172a; padding: 20px; text-align: center;">
+                <h2 style="color: #eab308; margin: 0; text-transform: uppercase; letter-spacing: 2px;">New Sourcing Request</h2>
+                <p style="color: #94a3b8; margin-top: 5px; font-size: 12px;">Ref: {request_id}</p>
+            </div>
+            
+            <div style="padding: 20px; background-color: #ffffff;">
+                <h3 style="color: #334155; border-bottom: 2px solid #f1f5f9; padding-bottom: 8px;">1. Client Information</h3>
+                <table style="width: 100%; border-collapse: collapse; font-size: 14px; margin-bottom: 20px;">
+                    <tr><td style="padding: 8px 0; color: #64748b; width: 120px;">Name/Username:</td><td style="font-weight: bold; color: #0f172a;">{buyer_name}</td></tr>
+                    <tr><td style="padding: 8px 0; color: #64748b;">Email Address:</td><td style="font-weight: bold; color: #0f172a;"><a href="mailto:{buyer_email}" style="color: #3b82f6;">{buyer_email}</a></td></tr>
+                    <tr><td style="padding: 8px 0; color: #64748b;">Phone Number:</td><td style="font-weight: bold; color: #0f172a;">{buyer_phone}</td></tr>
+                </table>
+
+                <h3 style="color: #334155; border-bottom: 2px solid #f1f5f9; padding-bottom: 8px;">2. Machinery Requirements</h3>
+                <table style="width: 100%; border-collapse: collapse; font-size: 14px; margin-bottom: 20px;">
+                    <tr><td style="padding: 8px 0; color: #64748b; width: 120px;">Equipment:</td><td style="font-weight: bold; color: #0f172a;">{req.equipment_type}</td></tr>
+                    <tr><td style="padding: 8px 0; color: #64748b;">Brand/Model:</td><td style="font-weight: bold; color: #0f172a;">{req.brand_preference}</td></tr>
+                    <tr><td style="padding: 8px 0; color: #64748b;">Condition:</td><td style="font-weight: bold; color: #0f172a;">{req.condition}</td></tr>
+                    <tr><td style="padding: 8px 0; color: #64748b;">Budget:</td><td style="font-weight: bold; color: #16a34a;">{req.currency} {req.budget:,.2f}</td></tr>
+                    <tr><td style="padding: 8px 0; color: #64748b;">Urgency:</td><td style="font-weight: bold; color: #ef4444;">{req.timeline.replace('_', ' ')}</td></tr>
+                </table>
+
+                <h3 style="color: #334155; border-bottom: 2px solid #f1f5f9; padding-bottom: 8px;">3. Technical Notes & Specs</h3>
+                <div style="background-color: #f8fafc; padding: 15px; border-radius: 6px; border-left: 4px solid #eab308; font-size: 14px; color: #334155; line-height: 1.5; white-space: pre-wrap;">
+                    {req.description}
+                </div>
+                
+                <p style="text-align: center; margin-top: 30px; font-size: 12px; color: #94a3b8;">
+                    Log into the DAGIV Admin Panel to manage this request.
+                </p>
+            </div>
+        </div>
+        """
+        
+        # 4. Dispatch the email asynchronously via Celery directly to your admin email
+        send_email_async.delay(
+            ADMIN_EMAIL, 
+            f"DAGIV SOURCING: {req.equipment_type} requested by {buyer_name}", 
+            email_html
+        )
+        
+        return {"status": "success", "request_id": request_id, "message": "Your sourcing request has been sent to our engineering team."}
+    except Exception as e:
+        conn.rollback()
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        cursor.close()
+        conn.close()
+
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8000)
