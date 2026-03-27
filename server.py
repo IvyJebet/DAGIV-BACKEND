@@ -9,6 +9,7 @@ import random
 import string
 import json
 import os
+import time
 from datetime import datetime, timedelta
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
@@ -19,15 +20,16 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from jose import JWTError, jwt
 import uvicorn
+from passlib.context import CryptContext
 from google import genai
 from google.oauth2 import id_token
 from google.auth.transport import requests as google_requests
 from typing import Optional
 import logging
+from psycopg2 import pool
 import requests
 from celery import Celery
 from dotenv import load_dotenv
-import os
 from mpesa_services import MpesaService
 from pesapal_services import PesapalService
 from io import BytesIO
@@ -39,6 +41,7 @@ from reportlab.graphics.barcode import qr
 from reportlab.graphics.shapes import Drawing
 from reportlab.graphics import renderPDF
 from routers.support import router as support_router
+from contextlib import asynccontextmanager  # <-- IMPORTED FOR LIFESPAN
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("dagiv_celery")
@@ -74,7 +77,69 @@ except Exception as e:
     print(f"⚠️ AI Client Init Error: {e}")
     ai_client = None
 
-app = FastAPI()
+# --- SECURITY UPGRADE: BCRYPT & RATE LIMITING ---
+pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+FAILED_LOGINS = {}
+MAX_LOGIN_ATTEMPTS = 5
+LOCKOUT_TIME = 300  # 5 minutes
+
+def hash_password(password: str) -> str:
+    return pwd_context.hash(password)
+
+def verify_password(plain_password: str, hashed_password: str) -> bool:
+    try:
+        return pwd_context.verify(plain_password, hashed_password)
+    except Exception:
+        # Fallback for old SHA-256 hashes during migration
+        return hashlib.sha256(plain_password.encode()).hexdigest() == hashed_password
+
+def check_rate_limit(ip: str):
+    now = time.time()
+    record = FAILED_LOGINS.get(ip, {'attempts': 0, 'locked_until': 0})
+    if now < record['locked_until']:
+        raise HTTPException(status_code=429, detail="Too many failed attempts. Try again in 5 minutes.")
+    return record
+
+def record_failed_login(ip: str):
+    now = time.time()
+    record = FAILED_LOGINS.get(ip, {'attempts': 0, 'locked_until': 0})
+    record['attempts'] += 1
+    if record['attempts'] >= MAX_LOGIN_ATTEMPTS:
+        record['locked_until'] = now + LOCKOUT_TIME
+    FAILED_LOGINS[ip] = record
+
+def clear_failed_login(ip: str):
+    if ip in FAILED_LOGINS:
+        del FAILED_LOGINS[ip]
+
+# --- FINANCIAL ENGINE ---
+COMMISSION_RATES = {
+    "SALE": 0.03,  # 3%
+    "RENT": 0.05,  # 5%
+    "PART": 0.10   # 10%
+}
+VAT_RATE = 0.16    # 16%
+
+
+# --- APP INITIALIZATION & LIFESPAN ---
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    print("🚀 Booting up DAGIV Backend and establishing connection pools...")
+    init_db_pool() # Initialize the connection pool FIRST
+    try:
+        startup_db()
+        print("✅ Database verification complete.")
+    except Exception as e:
+        print(f"❌ Critical Database Error during startup: {e}")
+    
+    yield # The app runs here
+    
+    print("🛑 DAGIV Backend is shutting down.")
+    if db_pool:
+        db_pool.closeall()
+
+app = FastAPI(lifespan=lifespan)
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"], 
@@ -85,6 +150,7 @@ app.add_middleware(
 
 app.include_router(support_router)
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="api/auth/login")
+
 class UserRegister(BaseModel):
     email: str
     phone: str
@@ -372,7 +438,6 @@ def send_sms_async(self, phone_number: str, message: str):
     except Exception as exc:
         raise self.retry(exc=exc, countdown=60)
 
-# 🛠️ FIX: Added explicit name="server.update_shipment_status_async"
 @celery_app.task(bind=True, max_retries=3, name="server.update_shipment_status_async")
 def update_shipment_status_async(self, tracking_number: str, new_status: str, location: str, notes: str):
     try:
@@ -421,11 +486,75 @@ def auto_close_stale_tickets():
         conn.close()
 
 # --- 4. HELPERS ---
-def get_db_connection():
-    return psycopg2.connect(DATABASE_URL)
 
-def hash_text(s: str) -> str:
-    return hashlib.sha256((s or "").encode()).hexdigest()
+# Global connection pool
+db_pool = None
+
+class PooledConnectionWrapper:
+    """
+    A smart wrapper that intercepts conn.close() and safely returns 
+    the connection to the pool instead of destroying it.
+    """
+    def __init__(self, conn, db_pool):
+        self._conn = conn
+        self._pool = db_pool
+
+    def cursor(self, *args, **kwargs):
+        return self._conn.cursor(*args, **kwargs)
+
+    def commit(self):
+        self._conn.commit()
+
+    def rollback(self):
+        self._conn.rollback()
+
+    @property
+    def autocommit(self):
+        return self._conn.autocommit
+
+    @autocommit.setter
+    def autocommit(self, value):
+        self._conn.autocommit = value
+
+    def close(self):
+        try:
+            # Clear any uncommitted transactions before handing back to the pool
+            self._conn.rollback() 
+        except:
+            pass
+        # Hand back to the pool instead of closing!
+        self._pool.putconn(self._conn) 
+
+def init_db_pool():
+    """Initializes the Threaded Connection Pool"""
+    global db_pool
+    db_url = DATABASE_URL
+    if db_url and "localhost" not in db_url and "127.0.0.1" not in db_url and "sslmode" not in db_url:
+        sep = "&" if "?" in db_url else "?"
+        db_url += f"{sep}sslmode=require"
+
+    try:
+        db_pool = pool.ThreadedConnectionPool(
+            minconn=1,
+            maxconn=20, # Keeps up to 20 connections alive and ready
+            dsn=db_url,
+            keepalives=1,
+            keepalives_idle=30,
+            keepalives_interval=10,
+            keepalives_count=5
+        )
+        print("🌊 Database Connection Pool initialized successfully.")
+    except Exception as e:
+        print(f"❌ Failed to initialize connection pool: {e}")
+
+def get_db_connection():
+    """Fetches a connection from the pool and wraps it for safe usage."""
+    global db_pool
+    if db_pool is None:
+        init_db_pool()
+        
+    conn = db_pool.getconn()
+    return PooledConnectionWrapper(conn, db_pool)
 
 def create_access_token(data: dict, expires_delta: Optional[timedelta] = None):
     to_encode = data.copy()
@@ -488,7 +617,7 @@ def draw_enterprise_pdf(p, title, doc_id, user, items, total_amount, currency, s
     
     p.setFont("Helvetica-Bold", 7)
     p.setFillColor(colors.HexColor("#64748b"))
-    p.drawString(margin + 2, height - 68, "HEAVY MACHINERY • SPARE PARTS • LOGISTICS")
+    p.drawString(margin + 2, height - 68, "HEAVY MACHINERY • AUTOMOTIVE • SPARE PARTS • LOGISTICS")
 
     # --- 3. DOCUMENT METADATA (Top Right) ---
     p.setFont("Helvetica-Bold", 18)
@@ -612,9 +741,9 @@ def draw_enterprise_pdf(p, title, doc_id, user, items, total_amount, currency, s
         p.setFont("Helvetica", 9)
         p.setFillColor(colors.black)
         p.drawCentredString(360, y, str(qty))
-        p.drawRightString(450, y, f"{u_price:,.2f}")
+        p.drawRightString(450, y, f"{float(u_price):,.2f}")
         p.setFont("Helvetica-Bold", 9)
-        p.drawRightString(width - margin - 10, y, f"{item_tot:,.2f}")
+        p.drawRightString(width - margin - 10, y, f"{float(item_tot):,.2f}")
         
         y -= 35
 
@@ -636,19 +765,19 @@ def draw_enterprise_pdf(p, title, doc_id, user, items, total_amount, currency, s
     p.setFillColor(colors.HexColor("#475569"))
     p.drawRightString(width - margin - label_offset, y, "Subtotal (Excl. VAT):")
     p.setFillColor(colors.black)
-    p.drawRightString(width - margin - 10, y, f"{currency} {subtotal_ex_vat:,.2f}")
+    p.drawRightString(width - margin - 10, y, f"{currency} {float(subtotal_ex_vat):,.2f}")
     
     y -= 18
     p.setFillColor(colors.HexColor("#475569"))
     p.drawRightString(width - margin - label_offset, y, "VAT (16%):")
     p.setFillColor(colors.black)
-    p.drawRightString(width - margin - 10, y, f"{currency} {vat_amount:,.2f}")
+    p.drawRightString(width - margin - 10, y, f"{currency} {float(vat_amount):,.2f}")
 
     y -= 18
     p.setFillColor(colors.HexColor("#475569"))
     p.drawRightString(width - margin - label_offset, y, "Platform Escrow Fee (1.5%):")
     p.setFillColor(colors.black)
-    p.drawRightString(width - margin - 10, y, f"{currency} {escrow_fee:,.2f}")
+    p.drawRightString(width - margin - 10, y, f"{currency} {float(escrow_fee):,.2f}")
 
     y -= 25
     p.setFont("Helvetica-Bold", 12)
@@ -656,7 +785,7 @@ def draw_enterprise_pdf(p, title, doc_id, user, items, total_amount, currency, s
     p.drawRightString(width - margin - label_offset, y, "GRAND TOTAL:")
     
     p.setFillColor(colors.HexColor("#16a34a")) if not is_quotation else p.setFillColor(colors.HexColor("#ea580c"))
-    p.drawRightString(width - margin - 10, y, f"{currency} {grand_total:,.2f}")
+    p.drawRightString(width - margin - 10, y, f"{currency} {float(grand_total):,.2f}")
 
     # --- 8. PAYMENT INSTRUCTIONS (For Quotes) ---
     y_footer = 140
@@ -694,7 +823,7 @@ def draw_enterprise_pdf(p, title, doc_id, user, items, total_amount, currency, s
     p.drawString(margin + 15, y_etr - 34, "This is a valid electronic receipt generated via the DAGIV Escrow System.")
 
     # 10. QR CODE for authenticity
-    qr_data = f"DAGIV|{doc_id}|{currency}{grand_total:,.2f}|{cuin}"
+    qr_data = f"DAGIV|{doc_id}|{currency}{float(grand_total):,.2f}|{cuin}"
     qr_code = qr.QrCodeWidget(qr_data)
     bounds = qr_code.getBounds()
     qr_width = bounds[2] - bounds[0]
@@ -709,12 +838,13 @@ def draw_enterprise_pdf(p, title, doc_id, user, items, total_amount, currency, s
 
 # --- 5. STARTUP & MIGRATIONS ---
 
-@app.on_event("startup")
+# REMOVED @app.on_event("startup")
 def startup_db():
     conn = get_db_connection()
+    conn.autocommit = True # Keeps the connection alive!
     cursor = conn.cursor()
     
-    # 0. Robust Users Table (from Phase 1)
+    # 0. Robust Users Table
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS users (
             id TEXT PRIMARY KEY,
@@ -738,7 +868,7 @@ def startup_db():
             buyer_id TEXT,
             seller_phone TEXT,
             listing_id TEXT,
-            total_amount REAL, 
+            total_amount DECIMAL(12,2), 
             currency TEXT,
             status TEXT DEFAULT 'PENDING_PAYMENT',
             payment_method TEXT,
@@ -754,7 +884,7 @@ def startup_db():
             order_id TEXT,
             listing_id TEXT,
             quantity INT,
-            unit_price REAL,
+            unit_price DECIMAL(12,2),
             seller_phone TEXT
         )
     """)
@@ -764,7 +894,7 @@ def startup_db():
         CREATE TABLE IF NOT EXISTS transactions (
             id TEXT PRIMARY KEY,
             order_id TEXT,
-            amount REAL,
+            amount DECIMAL(12,2),
             type TEXT, 
             status TEXT DEFAULT 'PENDING',
             checkout_request_id TEXT,  
@@ -786,7 +916,7 @@ def startup_db():
         )
     """)
 
-    # 4. Logistics Tracking Table (from Phase 5)
+    # 4. Logistics Tracking Table
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS logistics_tracking (
             id SERIAL PRIMARY KEY,
@@ -804,12 +934,12 @@ def startup_db():
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS support_tickets (
             id TEXT PRIMARY KEY,
-            buyer_id UUID REFERENCES users(id),         -- Changed TEXT to UUID
+            buyer_id UUID REFERENCES users(id),
             subject TEXT NOT NULL,
             category TEXT NOT NULL,
             status TEXT DEFAULT 'OPEN',
             priority TEXT DEFAULT 'MEDIUM',
-            assigned_agent_id UUID REFERENCES users(id), -- Changed TEXT to UUID
+            assigned_agent_id UUID REFERENCES users(id),
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
@@ -819,7 +949,7 @@ def startup_db():
         CREATE TABLE IF NOT EXISTS ticket_messages (
             id TEXT PRIMARY KEY,
             ticket_id TEXT REFERENCES support_tickets(id) ON DELETE CASCADE,
-            sender_id UUID REFERENCES users(id),         -- Changed TEXT to UUID
+            sender_id UUID REFERENCES users(id),
             message TEXT NOT NULL,
             is_internal_note BOOLEAN DEFAULT FALSE,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
@@ -833,7 +963,7 @@ def startup_db():
             equipment_type TEXT,
             brand_preference TEXT,
             condition TEXT,
-            budget REAL,
+            budget DECIMAL(12,2),
             currency TEXT DEFAULT 'KES',
             timeline TEXT,
             description TEXT,
@@ -841,49 +971,66 @@ def startup_db():
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     """)
-    
-    # 6. Migrations (Self-Healing)
-    try:
-        cursor.execute("ALTER TABLE orders ADD COLUMN IF NOT EXISTS listing_id TEXT")
-        cursor.execute("ALTER TABLE orders ADD COLUMN IF NOT EXISTS seller_phone TEXT")
-        cursor.execute("ALTER TABLE orders ADD COLUMN IF NOT EXISTS total_amount REAL") 
-        cursor.execute("ALTER TABLE orders ADD COLUMN IF NOT EXISTS currency TEXT")
-        cursor.execute("ALTER TABLE orders ADD COLUMN IF NOT EXISTS payment_method TEXT")
-        cursor.execute("ALTER TABLE orders ADD COLUMN IF NOT EXISTS shipping_details JSONB")
-        cursor.execute("ALTER TABLE order_line_items ADD COLUMN IF NOT EXISTS unit_price REAL")
-        cursor.execute("ALTER TABLE transactions ADD COLUMN IF NOT EXISTS type TEXT")          
-        cursor.execute("ALTER TABLE transactions ALTER COLUMN type TYPE TEXT USING type::text")
-        cursor.execute("ALTER TABLE transactions ADD COLUMN IF NOT EXISTS status TEXT DEFAULT 'PENDING'") 
-        cursor.execute("ALTER TABLE transactions ALTER COLUMN status TYPE TEXT USING status::text")
-        cursor.execute("ALTER TABLE transactions ADD COLUMN IF NOT EXISTS checkout_request_id TEXT")
-        cursor.execute("ALTER TABLE transactions ADD COLUMN IF NOT EXISTS mpesa_receipt TEXT")
-        cursor.execute("ALTER TABLE transactions ADD COLUMN IF NOT EXISTS phone_number TEXT")
+
+    # --- 🟢 ADDED: Marketplace & Seller Tables (Moved from endpoints to startup) ---
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS sellers (
+            id SERIAL PRIMARY KEY,
+            name TEXT,
+            phone TEXT UNIQUE,
+            location TEXT,
+            email TEXT,
+            status TEXT DEFAULT 'PENDING',
+            rating DECIMAL(12,2) DEFAULT 0.0,
+            joined_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            business_type TEXT,
+            reg_number TEXT,
+            doc_primary TEXT,
+            doc_secondary TEXT,
+            doc_proof TEXT
+        )
+    """)
+
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS marketplace_listings (
+            id TEXT PRIMARY KEY,
+            listing_type TEXT,
+            seller_name TEXT,
+            phone TEXT,
+            location TEXT,
+            category TEXT,
+            sub_category TEXT,
+            brand TEXT,
+            model TEXT,
+            price DECIMAL(12,2),
+            currency TEXT,
+            specs JSONB,
+            status TEXT DEFAULT 'PENDING_REVIEW',
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+
+    # --- ⚡ ADDED: The 100x Speedup Indexes ---
+    print("⚡ Building database indexes for performance...")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_marketplace_status ON marketplace_listings(status);")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_marketplace_created ON marketplace_listings(created_at DESC);")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_marketplace_phone ON marketplace_listings(phone);")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_sellers_phone ON sellers(phone);")
         
-        # Add new Auth columns if table existed before Phase 1
-        cursor.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS google_id TEXT UNIQUE")
-        cursor.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS otp_code TEXT")
-        cursor.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS otp_expires_at TIMESTAMP")
-        cursor.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS is_verified BOOLEAN DEFAULT FALSE")
-        cursor.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS username TEXT UNIQUE")
-        conn.commit()
-    except Exception as e:
-        print(f"Migration Info: {e}")
-        conn.rollback()
     try:
         cursor.execute("SELECT id FROM users WHERE username = 'admin'")
         if not cursor.fetchone():
             admin_id = str(uuid.uuid4())
-            admin_pass = hash_text("admin")
+            admin_pass = hash_password("admin")
             cursor.execute("""
                 INSERT INTO users (id, username, password_hash, role, email, phone, is_verified, security_question, security_answer_hash)
                 VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
             """, (admin_id, "admin", admin_pass, "admin", "admin@dagiv.co.ke", "0700000000", True, "Default", admin_pass))
-            conn.commit()
             print("✅ Default Admin account created for Desktop App.")
     except Exception as e:
         print(f"Admin Creation Info: {e}")
-        conn.rollback()
-    conn.commit()
+        
+    cursor.close()
     conn.close()
 
 @app.get("/")
@@ -912,7 +1059,7 @@ def register_user(user: UserRegister):
                 raise HTTPException(status_code=400, detail="Email, Phone, or Username already registered and verified.")
             else:
                 new_user_id = existing_user['id']
-                hashed_pw = hash_text(user.password)
+                hashed_pw = hash_password(user.password)
                 
                 # 🛠️ FIX: Added 'email = %s' to ensure the DB syncs with the frontend's cleaned email
                 cursor.execute("""
@@ -922,7 +1069,7 @@ def register_user(user: UserRegister):
                 """, (hashed_pw, user.phone, user.username, user.email, new_user_id))
         else:
             new_user_id = str(uuid.uuid4())
-            hashed_pw = hash_text(user.password)
+            hashed_pw = hash_password(user.password)
             cursor.execute("""
                 INSERT INTO users (id, email, phone, password_hash, role, is_verified, username)
                 VALUES (%s, %s, %s, %s, %s, FALSE, %s)
@@ -935,19 +1082,18 @@ def register_user(user: UserRegister):
             ON CONFLICT (user_id) DO NOTHING
         """, (new_user_id,))
         
-        # Note: Seller profile creation block was intentionally removed.
-        
-        # 3. OTP Generation & Storage (Saving directly to users table)
+        # 3. Secure OTP Generation & Storage (Saving directly to users table)
         cursor.execute("DELETE FROM otps WHERE user_id = %s", (new_user_id,)) # Legacy cleanup
         
-        otp_code = str(random.randint(100000, 999999))
+        plain_otp = str(random.randint(100000, 999999))
+        hashed_otp = hash_password(plain_otp) # STORE SECURELY
         expires_at = datetime.utcnow() + timedelta(minutes=10)
         
         cursor.execute("""
             UPDATE users 
             SET otp_code = %s, otp_expires_at = %s 
             WHERE id = %s
-        """, (otp_code, expires_at, new_user_id))
+        """, (hashed_otp, expires_at, new_user_id))
         
         # --- 🛑 CRITICAL FIX: Commit DB Transaction First ---
         conn.commit()
@@ -958,7 +1104,7 @@ def register_user(user: UserRegister):
             <h2 style="color: #0f172a;">Verify Your DAGIV Account</h2>
             <p style="color: #64748b;">Welcome to DAGIV Engineering. Use the code below to complete your registration:</p>
             <div style="background: #f8fafc; padding: 20px; text-align: center; border-radius: 8px; margin: 20px 0;">
-                <span style="font-size: 32px; font-weight: 900; letter-spacing: 5px; color: #eab308;">{otp_code}</span>
+                <span style="font-size: 32px; font-weight: 900; letter-spacing: 5px; color: #eab308;">{plain_otp}</span>
             </div>
             <p style="font-size: 12px; color: #94a3b8;">This code expires in 10 minutes.</p>
         </div>
@@ -969,7 +1115,7 @@ def register_user(user: UserRegister):
             send_email_async.delay(user.email, "Verify Your DAGIV Account", email_body)
         except Exception as celery_err:
             logger.error(f"Celery Warning: Could not dispatch task -> {celery_err}")
-            print(f"\n[DEBUG] CELERY UNAVAILABLE - OTP FOR {user.email}: {otp_code}\n")
+            print(f"\n[DEBUG] CELERY UNAVAILABLE - OTP FOR {user.email}: {plain_otp}\n")
 
         return {"requiresOtp": True, "user_id": new_user_id}
 
@@ -993,8 +1139,11 @@ def verify_otp(req: OTPVerifyRequest):
         
         if not user:
             raise HTTPException(status_code=404, detail="User not found")
-        if user['otp_code'] != req.otp_code:
+        
+        # Verify Hashed OTP
+        if not verify_password(req.otp_code, user['otp_code']):
             raise HTTPException(status_code=400, detail="Invalid OTP code")
+            
         if user['otp_expires_at'] < datetime.utcnow():
             raise HTTPException(status_code=400, detail="OTP has expired")
             
@@ -1060,18 +1209,24 @@ def google_auth(req: GoogleAuthRequest):
         raise HTTPException(status_code=500, detail=str(e))
     
 @app.post("/api/auth/login", response_model=Token)
-def login(login_data: LoginRequest):
+def login(login_data: LoginRequest, request: Request):
+    client_ip = request.client.host
+    check_rate_limit(client_ip)
+
     conn = get_db_connection()
     cursor = conn.cursor(cursor_factory=RealDictCursor)
     cursor.execute("SELECT id, username, password_hash, role, is_verified FROM users WHERE username=%s OR email=%s", (login_data.identifier, login_data.identifier))
     user = cursor.fetchone()
     conn.close()
 
-    if not user or hash_text(login_data.password) != user['password_hash']:
+    if not user or not verify_password(login_data.password, user['password_hash']):
+        record_failed_login(client_ip)
         raise HTTPException(status_code=400, detail="Invalid credentials")
+        
     if not user['is_verified']:
         raise HTTPException(status_code=403, detail="Account not verified. Please verify your OTP.")
 
+    clear_failed_login(client_ip)
     access_token = create_access_token(data={"sub": str(user['id']), "role": user['role']})
     return {
         "access_token": access_token, 
@@ -1133,7 +1288,7 @@ def get_cart(user: dict = Depends(get_current_user)):
                 item['image'] = "https://via.placeholder.com/300?text=No+Image"
             
             del item['specs'] 
-            total_value += (item['price'] * item['quantity'])
+            total_value += (float(item['price']) * item['quantity'])
 
         return {
             "items": items,
@@ -1187,7 +1342,7 @@ def generate_cart_quotation(user: dict = Depends(get_current_user)):
         user.update(user_info)
 
         currency = items[0]['currency'] if items else "KES"
-        total = sum(item['unit_price'] * item['quantity'] for item in items)
+        total = sum(float(item['unit_price']) * item['quantity'] for item in items)
         quote_id = f"QT-{uuid.uuid4().hex[:8].upper()}"
 
         buffer = BytesIO()
@@ -1272,7 +1427,7 @@ def get_buyer_orders(user: dict = Depends(get_current_user)):
                     "model": item['model'],
                     "image": image,
                     "quantity": item['quantity'],
-                    "price": item['price'],
+                    "price": float(item['price']),
                     "category": item['category'] or "Heavy Equipment",
                     "listing_type": item['listing_type'] or "SALE"
                 })
@@ -1280,7 +1435,7 @@ def get_buyer_orders(user: dict = Depends(get_current_user)):
             result.append({
                 "id": order['id'],
                 "date": order['date'].isoformat() if isinstance(order['date'], datetime) else order['date'],
-                "total": order['total'],
+                "total": float(order['total']),
                 "currency": order['currency'],
                 "status": order['status'],
                 "items": items,
@@ -1293,6 +1448,7 @@ def get_buyer_orders(user: dict = Depends(get_current_user)):
         raise HTTPException(status_code=500, detail="Failed to fetch orders")
     finally:
         conn.close()
+
 @app.get("/api/orders/{order_id}/invoice")
 def generate_invoice(order_id: str, user: dict = Depends(get_current_user)):
     """Dynamically generates an Enterprise-Grade PDF commercial invoice/ETR"""
@@ -1327,7 +1483,7 @@ def generate_invoice(order_id: str, user: dict = Depends(get_current_user)):
             doc_id=order['id'], 
             user=user, 
             items=items, 
-            total_amount=order['total_amount'], 
+            total_amount=float(order['total_amount']), 
             currency=order['currency'], 
             status=order['status'], 
             is_quotation=False
@@ -1345,6 +1501,7 @@ def generate_invoice(order_id: str, user: dict = Depends(get_current_user)):
         raise HTTPException(status_code=500, detail="Failed to generate invoice")
     finally:
         conn.close()
+
 @app.post("/api/ai-consultant")
 def ask_ai_engineer(req: AIChatRequest):
     if not ai_client:
@@ -1370,8 +1527,8 @@ def ask_ai_engineer(req: AIChatRequest):
 
 @app.post("/api/book-inspection")
 def book_inspection(request: InspectionRequest, background_tasks: BackgroundTasks):
+    conn = get_db_connection()
     try:
-        conn = get_db_connection()
         cursor = conn.cursor()
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS inspection_requests (
@@ -1389,18 +1546,20 @@ def book_inspection(request: InspectionRequest, background_tasks: BackgroundTask
             (request.machineType, request.location, request.contactPerson, request.phone, request.date)
         )
         conn.commit()
-        conn.close()
         
         details = f"Machine: {request.machineType}\nLocation: {request.location}\nClient: {request.contactPerson}\nPhone: {request.phone}\nRequested Date: {request.date}"
         background_tasks.add_task(send_email_alert, "Inspection Booking", details)
         return {"status": "success", "message": "Inspection booked"}
     except Exception as e:
+        conn.rollback()
         return {"status": "error", "detail": str(e)}
+    finally:
+        conn.close()
     
 @app.post("/api/operator-logs")
 def submit_log(log: OperatorLog, background_tasks: BackgroundTasks, current_user: dict = Depends(get_current_user)):
+    conn = get_db_connection()
     try:
-        conn = get_db_connection()
         cursor = conn.cursor()
         try:
             t_start = datetime.strptime(log.startTime, "%H:%M")
@@ -1426,19 +1585,21 @@ def submit_log(log: OperatorLog, background_tasks: BackgroundTasks, current_user
         """, (log.machineId, log.date, round(duration, 2), log.startOdometer, full_remarks, usage_unit))
         
         conn.commit()
-        conn.close()
         
         if clean_notes or log.fuelAddedLiters > 0:
             details = f"Vehicle: {log.machineId}\nOperator: {log.operatorName}\nWork Duration: {round(duration, 2)} hrs\nCurrent Reading: {log.startOdometer} {usage_unit}\nNotes: {clean_notes}"
             background_tasks.add_task(send_email_alert, "Daily Log Alert", details)
         return {"status": "success", "message": "Log submitted securely"}
     except Exception as e:
+        conn.rollback()
         return {"status": "error", "detail": str(e)}
+    finally:
+        conn.close()
 
 @app.post("/api/consultation")
 def book_consultation(req: ConsultationRequest, background_tasks: BackgroundTasks):
+    conn = get_db_connection()
     try:
-        conn = get_db_connection()
         cursor = conn.cursor()
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS consultation_requests (
@@ -1456,17 +1617,19 @@ def book_consultation(req: ConsultationRequest, background_tasks: BackgroundTask
             (req.name, req.phone, req.type, req.details)
         )
         conn.commit()
-        conn.close()
         details = f"Client: {req.name}\nPhone: {req.phone}\nConsult Type: {req.type}\n\nProject Details:\n{req.details}"
         background_tasks.add_task(send_email_alert, "Consultation Request", details)
         return {"status": "success", "message": "Consultation booked"}
     except Exception as e:
+        conn.rollback()
         return {"status": "error", "detail": str(e)}
+    finally:
+        conn.close()
 
 @app.post("/api/service-request")
 def request_service(req: ServiceRequest, background_tasks: BackgroundTasks):
+    conn = get_db_connection()
     try:
-        conn = get_db_connection()
         cursor = conn.cursor()
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS service_inquiries (
@@ -1487,17 +1650,19 @@ def request_service(req: ServiceRequest, background_tasks: BackgroundTasks):
             (req.name, req.phone, req.email, req.serviceType, req.details, req.company)
         )
         conn.commit()
-        conn.close()
         details = f"Client: {req.name}\nCompany: {req.company}\nPhone: {req.phone}\nEmail: {req.email}\nService: {req.serviceType}\n\nRequirements:\n{req.details}"
         background_tasks.add_task(send_email_alert, "Service Request", details)
         return {"status": "success", "message": "Service request received"}
     except Exception as e:
+        conn.rollback()
         return {"status": "error", "detail": str(e)}
+    finally:
+        conn.close()
 
 @app.post("/api/lease-request")
 def request_lease(req: LeaseRequestKP, background_tasks: BackgroundTasks):
+    conn = get_db_connection()
     try:
-        conn = get_db_connection()
         cursor = conn.cursor()
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS service_inquiries (
@@ -1519,50 +1684,55 @@ def request_lease(req: LeaseRequestKP, background_tasks: BackgroundTasks):
             (req.customerName, req.phone, details_str)
         )
         conn.commit()
-        conn.close()
         details = f"Client: {req.customerName}\nPhone: {req.phone}\nTarget Machine: {req.machineName}\nDuration: {req.duration}"
         background_tasks.add_task(send_email_alert, "Lease Inquiry", details)
         return {"status": "success", "message": "Lease inquiry sent"}
     except Exception as e:
+        conn.rollback()
         return {"status": "error", "detail": str(e)}
+    finally:
+        conn.close()
 
 
 @app.post("/api/sellers/check")
 def check_seller_status(check: SellerCheck):
     conn = get_db_connection()
-    cursor = conn.cursor()
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS sellers (
-            id SERIAL PRIMARY KEY,
-            name TEXT,
-            phone TEXT UNIQUE,
-            location TEXT,
-            email TEXT,
-            status TEXT DEFAULT 'PENDING',
-            rating REAL DEFAULT 0.0,
-            joined_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            business_type TEXT,
-            reg_number TEXT,
-            doc_primary TEXT,
-            doc_secondary TEXT,
-            doc_proof TEXT
-        )
-    """)
     try:
-        cursor.execute("ALTER TABLE sellers ADD COLUMN doc_primary TEXT")
-        cursor.execute("ALTER TABLE sellers ADD COLUMN doc_secondary TEXT")
-        cursor.execute("ALTER TABLE sellers ADD COLUMN doc_proof TEXT")
-    except:
-        conn.rollback()
-    else:
-        conn.commit()
-    cursor.execute("SELECT name, status, id FROM sellers WHERE phone = %s", (check.phone,))
-    result = cursor.fetchone()
-    conn.close()
-    if result:
-        return {"exists": True, "name": result[0], "status": result[1], "sellerId": result[2]}
-    else:
-        return {"exists": False, "status": "UNKNOWN"}
+        cursor = conn.cursor()
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS sellers (
+                id SERIAL PRIMARY KEY,
+                name TEXT,
+                phone TEXT UNIQUE,
+                location TEXT,
+                email TEXT,
+                status TEXT DEFAULT 'PENDING',
+                rating DECIMAL(12,2) DEFAULT 0.0,
+                joined_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                business_type TEXT,
+                reg_number TEXT,
+                doc_primary TEXT,
+                doc_secondary TEXT,
+                doc_proof TEXT
+            )
+        """)
+        try:
+            cursor.execute("ALTER TABLE sellers ADD COLUMN doc_primary TEXT")
+            cursor.execute("ALTER TABLE sellers ADD COLUMN doc_secondary TEXT")
+            cursor.execute("ALTER TABLE sellers ADD COLUMN doc_proof TEXT")
+        except:
+            conn.rollback()
+        else:
+            conn.commit()
+        cursor.execute("SELECT name, status, id FROM sellers WHERE phone = %s", (check.phone,))
+        result = cursor.fetchone()
+        
+        if result:
+            return {"exists": True, "name": result[0], "status": result[1], "sellerId": result[2]}
+        else:
+            return {"exists": False, "status": "UNKNOWN"}
+    finally:
+        conn.close()
 
 @app.post("/api/sellers/register")
 def register_seller(seller: SellerRegistration, background_tasks: BackgroundTasks):
@@ -1578,7 +1748,7 @@ def register_seller(seller: SellerRegistration, background_tasks: BackgroundTask
             cursor.execute("UPDATE users SET role = 'SELLER', is_verified = TRUE WHERE id = %s", (final_user_id,))
         else:
             user_uuid = str(uuid.uuid4())
-            hashed_pw = hash_text(seller.password)
+            hashed_pw = hash_password(seller.password)
             
             # FIX 1: Generate a truly unique username to prevent database crashes
             base_username = seller.email.split('@')[0]
@@ -1625,13 +1795,15 @@ def register_seller(seller: SellerRegistration, background_tasks: BackgroundTask
 
 @app.post("/api/marketplace/submit")
 def submit_listing(item: MarketListing, background_tasks: BackgroundTasks, user: dict = Depends(get_current_user)):
+    conn = get_db_connection()
+    cursor = None
     try:
-        conn = get_db_connection()
         cursor = conn.cursor()
         cursor.execute("SELECT phone FROM users WHERE id = %s", (user['user_id'],))
         user_row = cursor.fetchone()
         if not user_row:
             raise HTTPException(status_code=404, detail="User profile not found. Please re-login.")
+            
         db_phone = user_row[0]
         item.phone = db_phone 
         cursor.execute("""
@@ -1645,38 +1817,58 @@ def submit_listing(item: MarketListing, background_tasks: BackgroundTasks, user:
                 sub_category TEXT,
                 brand TEXT,
                 model TEXT,
-                price REAL,
+                price DECIMAL(12,2),
                 currency TEXT,
                 specs JSONB,
                 status TEXT DEFAULT 'PENDING_REVIEW',
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """)
-        import time
+        
+        base_price = float(item.price)
+        commission_rate = COMMISSION_RATES.get(item.listingType, 0.05)
+        commission_amount = base_price * commission_rate
+        vat_amount = base_price * VAT_RATE
+        final_display_price = base_price + vat_amount
+        
+        item.specs['financials'] = {
+            "basePrice": round(base_price, 2),
+            "commissionRate": commission_rate,
+            "commissionAmount": round(commission_amount, 2),
+            "vatRate": VAT_RATE,
+            "vatAmount": round(vat_amount, 2),
+            "finalPrice": round(final_display_price, 2)
+        }
+        
         listing_id = f"LST-{int(time.time())}"
         specs_json = json.dumps(item.specs)
+        
         cursor.execute("""
             INSERT INTO marketplace_listings 
             (id, listing_type, seller_name, phone, location, category, sub_category, brand, model, price, currency, specs, status)
             VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 'ACTIVE')
         """, (listing_id, item.listingType, item.sellerName, item.phone, item.location, 
               item.category, item.subCategory, item.brand, item.model, 
-              item.price, item.currency, specs_json))
+              round(final_display_price, 2), item.currency, specs_json))
         conn.commit()
-        conn.close()
+        
         background_tasks.add_task(send_email_alert, "New Listing (Live)", f"ID: {listing_id}\nSeller: {item.sellerName}\nPhone: {item.phone}\nItem: {item.brand} {item.model}\nStatus: LIVE")
         return {"status": "success", "listingId": listing_id, "message": "Listing is now LIVE"}
     except Exception as e:
+        conn.rollback()
         return {"status": "error", "detail": str(e)}
+    finally:
+        if cursor: cursor.close() # ⚡ FIX: Release the cursor
+        conn.close()
 
 # --- NEW: EDIT LISTING ENDPOINT ---
 @app.put("/api/marketplace/edit/{listing_id}")
 def edit_listing(listing_id: str, item: MarketListing, user: dict = Depends(get_current_user)):
+    conn = get_db_connection()
+    cursor = None
     try:
-        conn = get_db_connection()
         cursor = conn.cursor()
         
-        # Verify the user actually owns this listing
         cursor.execute("SELECT phone FROM users WHERE id = %s", (user['user_id'],))
         user_row = cursor.fetchone()
         if not user_row: 
@@ -1689,15 +1881,30 @@ def edit_listing(listing_id: str, item: MarketListing, user: dict = Depends(get_
         if not listing or listing[0] != db_phone:
             raise HTTPException(status_code=403, detail="Unauthorized: You can only edit your own listings.")
             
+        base_price = float(item.price)
+        commission_rate = COMMISSION_RATES.get(item.listingType, 0.05)
+        commission_amount = base_price * commission_rate
+        vat_amount = base_price * VAT_RATE
+        final_display_price = base_price + vat_amount
+        
+        item.specs['financials'] = {
+            "basePrice": round(base_price, 2),
+            "commissionRate": commission_rate,
+            "commissionAmount": round(commission_amount, 2),
+            "vatRate": VAT_RATE,
+            "vatAmount": round(vat_amount, 2),
+            "finalPrice": round(final_display_price, 2)
+        }
+        
         specs_json = json.dumps(item.specs)
         
         cursor.execute("""
             UPDATE marketplace_listings 
             SET listing_type = %s, category = %s, sub_category = %s, brand = %s, 
-                model = %s, price = %s, currency = %s, specs = %s, location = %s
+                model = %s, price = %s, currency = %s, specs = %s, location = %s, status = %s
             WHERE id = %s
         """, (item.listingType, item.category, item.subCategory, item.brand, 
-              item.model, item.price, item.currency, specs_json, item.location, listing_id))
+              item.model, round(final_display_price, 2), item.currency, specs_json, item.location, item.specs.get('listingStatus', 'ACTIVE'), listing_id))
               
         conn.commit()
         return {"status": "success", "message": "Listing updated successfully"}
@@ -1705,6 +1912,7 @@ def edit_listing(listing_id: str, item: MarketListing, user: dict = Depends(get_
         conn.rollback()
         raise HTTPException(status_code=500, detail=str(e))
     finally:
+        if cursor: cursor.close() # ⚡ FIX: Release the cursor
         conn.close()
 
 @app.get("/api/seller/dashboard")
@@ -1780,9 +1988,9 @@ def process_checkout(req: CheckoutProcessRequest, background_tasks: BackgroundTa
                 config = lease_configs.get(item['listing_id'], {})
                 days = int(config.get('days', 1))
                 # For now, base price acts as DRY rate. (You can add wet_rate logic here later if added to DB)
-                subtotal += item['price'] * item['quantity'] * days
+                subtotal += float(item['price']) * item['quantity'] * days
             else:
-                subtotal += item['price'] * item['quantity']
+                subtotal += float(item['price']) * item['quantity']
 
         shipping_cost = 0.0 
         escrow_fee = subtotal * 0.015 # 1.5% Escrow Fee
@@ -1803,7 +2011,7 @@ def process_checkout(req: CheckoutProcessRequest, background_tasks: BackgroundTa
             cursor.execute("""
                 INSERT INTO order_line_items (order_id, listing_id, quantity, unit_price, seller_phone)
                 VALUES (%s, %s, %s, %s, %s)
-            """, (order_id, item['listing_id'], item['quantity'], item['price'] * multiplier, item['seller_phone']))
+            """, (order_id, item['listing_id'], item['quantity'], float(item['price']) * multiplier, item['seller_phone']))
 
         cursor.execute("DELETE FROM cart_items WHERE user_id = %s", (user['user_id'],))
         
@@ -1847,6 +2055,7 @@ def process_checkout(req: CheckoutProcessRequest, background_tasks: BackgroundTa
         background_tasks.add_task(send_email_alert, "New Order via Checkout", f"Order ID: {order_id}\nTotal: KES {total}\nMethod: {req.payment_method}")
         return {"status": "success", "order_id": order_id, "payment_info": payment_info}
     except HTTPException as he:
+        conn.rollback()
         raise he 
     except Exception as e:
         conn.rollback()
@@ -1866,15 +2075,22 @@ def release_escrow(order_id: str, user: dict = Depends(get_current_user)):
             raise HTTPException(status_code=400, detail="Order is not in a releasable state")
 
         cursor.execute("UPDATE orders SET status = 'RELEASED' WHERE id = %s", (order_id,))
-        cursor.execute("SELECT seller_phone, unit_price, quantity FROM order_line_items WHERE order_id = %s", (order_id,))
+        cursor.execute("""
+            SELECT li.seller_phone, li.unit_price, li.quantity, m.listing_type
+            FROM order_line_items li 
+            JOIN marketplace_listings m ON li.listing_id = m.id 
+            WHERE li.order_id = %s
+        """, (order_id,))
         items = cursor.fetchall()
         
-        PLATFORM_COMMISSION = 0.05 # DAGIV takes a 5% cut
-
         for item in items:
-            item_total = item['unit_price'] * item['quantity']
-            dagiv_cut = item_total * PLATFORM_COMMISSION
-            net_payout = item_total - dagiv_cut # Money going to seller
+            item_total = float(item['unit_price']) * item['quantity']
+            
+            # Recalculate true base to deduct commission (unit_price includes VAT)
+            base_item_total = item_total / (1 + VAT_RATE)
+            commission_rate = COMMISSION_RATES.get(item['listing_type'], 0.05)
+            dagiv_cut = base_item_total * commission_rate
+            net_payout = base_item_total - dagiv_cut # Money going to seller
             
             cursor.execute("SELECT id FROM users WHERE phone = %s", (item['seller_phone'],))
             seller = cursor.fetchone()
@@ -1887,10 +2103,15 @@ def release_escrow(order_id: str, user: dict = Depends(get_current_user)):
                 """, (item_total, net_payout, seller['id']))
         conn.commit()
         return {"status": "success", "message": "Funds have been released to the seller (Commission deducted)."}
-    finally: conn.close()
+    except Exception as e:
+        conn.rollback()
+        raise HTTPException(status_code=500, detail=str(e))
+    finally: 
+        conn.close()
 
 @app.post("/api/payments/mpesa/callback")
 async def mpesa_callback(request: Request, background_tasks: BackgroundTasks):
+    conn = None
     try:
         data = await request.json()
         callback_data = data.get("Body", {}).get("stkCallback", {})
@@ -1909,20 +2130,23 @@ async def mpesa_callback(request: Request, background_tasks: BackgroundTasks):
                 cursor.execute("SELECT seller_phone, unit_price, quantity FROM order_line_items WHERE order_id = %s", (order_id,))
                 items = cursor.fetchall()
                 for item in items:
-                    item_total = item['unit_price'] * item['quantity']
+                    item_total = float(item['unit_price']) * item['quantity']
                     cursor.execute("SELECT id FROM users WHERE phone = %s", (item['seller_phone'],))
                     seller = cursor.fetchone()
                     if seller:
                         cursor.execute("UPDATE wallets SET balance_pending = balance_pending + %s WHERE user_id = %s", (item_total, seller['id']))
                 conn.commit()
                 background_tasks.add_task(send_email_alert, "Escrow Secured (M-Pesa)", f"Order {order_id} has been fully funded.")
-            conn.close()
         return {"ResultCode": 0, "ResultDesc": "Accepted"}
     except Exception as e:
+        if conn: conn.rollback()
         return {"ResultCode": 1, "ResultDesc": "Rejected"}
+    finally:
+        if conn: conn.close()
 
 @app.get("/api/marketplace/listings")
 def get_public_listings():
+    start_time = time.time()
     conn = get_db_connection()
     cursor = conn.cursor(cursor_factory=RealDictCursor)
     try:
@@ -1934,29 +2158,42 @@ def get_public_listings():
             WHERE m.status = 'ACTIVE' ORDER BY m.created_at DESC
         """)
         listings = cursor.fetchall()
+        
         for item in listings:
+            # PostgreSQL JSONB usually returns a dict, but we fallback to json.loads just in case
             if isinstance(item['specs'], str):
-                item['specs'] = json.loads(item['specs'])
-                if 'images' in item['specs'] and len(item['specs']['images']) > 0:
-                    item['images'] = item['specs']['images']
-                else:
-                    item['images'] = ["https://via.placeholder.com/300?text=No+Image"]
+                try:
+                    item['specs'] = json.loads(item['specs'])
+                except Exception:
+                    item['specs'] = {}
+
+            if isinstance(item.get('specs'), dict) and 'images' in item['specs'] and len(item['specs']['images']) > 0:
+                item['images'] = item['specs']['images']
+            else:
+                item['images'] = ["https://via.placeholder.com/300?text=No+Image"]
+                
             item['verifiedByDagiv'] = True
             
             if item.get("real_seller_name"):
+                joined_date = item.get("seller_joined_date") or item.get("created_at")
                 item["seller"] = {
                     "id": item["seller_id"],
                     "name": item["real_seller_name"],
                     "rating": float(item["seller_rating"]) if item["seller_rating"] is not None else 0.0,
-                    "joinedDate": item["seller_joined_date"].isoformat() if item["seller_joined_date"] else item["created_at"].isoformat(),
+                    "joinedDate": joined_date.isoformat() if hasattr(joined_date, 'isoformat') else str(joined_date),
                     "type": item["seller_type"],
                     "verified": item["seller_status"] == 'VERIFIED'
                 }
+                
+        logger.info(f"✅ Fetched {len(listings)} listings in {time.time() - start_time:.2f} seconds")
         return listings
+        
     except Exception as e:
-        print(e)
-        return []
+        logger.error(f"❌ Error fetching marketplace listings: {e}")
+        # Raise an actual 500 error instead of returning an empty list
+        raise HTTPException(status_code=500, detail="Failed to load listings from the database.")
     finally:
+        cursor.close()
         conn.close()
 
 @app.get("/api/seller/orders")
@@ -2000,7 +2237,7 @@ def get_seller_orders(user: dict = Depends(require_role("SELLER"))):
                 "id": row['id'],
                 "brand": row['brand'],
                 "model": row['model'],
-                "amount": row['amount'],
+                "amount": float(row['amount']),
                 "currency": row['currency'],
                 "status": row['status'],
                 "buyer_contact": f"{row['buyer_name']} ({row['buyer_phone']})",
@@ -2122,22 +2359,30 @@ def simulate_order_flow(order_id: str, background_tasks: BackgroundTasks):
                 cursor.execute("SELECT seller_phone, unit_price, quantity FROM order_line_items WHERE order_id = %s", (order_id,))
                 items = cursor.fetchall()
                 for item in items:
-                    item_total = item['unit_price'] * item['quantity']
+                    item_total = float(item['unit_price']) * item['quantity']
                     cursor.execute("SELECT id FROM users WHERE phone = %s", (item['seller_phone'],))
                     seller = cursor.fetchone()
                     if seller:
                         cursor.execute("UPDATE wallets SET balance_pending = balance_pending + %s WHERE user_id = %s", (item_total, seller['id']))
 
-            # --- MOCK ESCROW RELEASE (Since buyer UI is deleted) ---
+            # --- MOCK ESCROW RELEASE ---
             if next_status == 'RELEASED':
-                cursor.execute("SELECT seller_phone, unit_price, quantity FROM order_line_items WHERE order_id = %s", (order_id,))
+                cursor.execute("""
+                    SELECT li.seller_phone, li.unit_price, li.quantity, m.listing_type 
+                    FROM order_line_items li 
+                    JOIN marketplace_listings m ON li.listing_id = m.id 
+                    WHERE li.order_id = %s
+                """, (order_id,))
                 items = cursor.fetchall()
-                PLATFORM_COMMISSION = 0.05 # DAGIV takes a 5% cut
                 
                 for item in items:
-                    item_total = item['unit_price'] * item['quantity']
-                    dagiv_cut = item_total * PLATFORM_COMMISSION
-                    net_payout = item_total - dagiv_cut # Money going to seller
+                    item_total = float(item['unit_price']) * item['quantity']
+                    
+                    # Recalculate true base to deduct commission (unit_price includes VAT)
+                    base_item_total = item_total / (1 + VAT_RATE)
+                    commission_rate = COMMISSION_RATES.get(item['listing_type'], 0.05)
+                    dagiv_cut = base_item_total * commission_rate
+                    net_payout = base_item_total - dagiv_cut # Money going to seller
                     
                     cursor.execute("SELECT id FROM users WHERE phone = %s", (item['seller_phone'],))
                     seller = cursor.fetchone()
@@ -2156,6 +2401,9 @@ def simulate_order_flow(order_id: str, background_tasks: BackgroundTasks):
             return {"status": "success", "new_status": next_status, "message": f"Successfully moved to {next_status} and applied wallet logic."}
             
         return {"status": "success", "message": "Order is already at RELEASED. Funds are securely in the Available Balance."}
+    except Exception as e:
+        conn.rollback()
+        raise HTTPException(status_code=500, detail=str(e))
     finally:
         conn.close()
 
@@ -2236,7 +2484,7 @@ def request_withdrawal(req: WithdrawRequest, background_tasks: BackgroundTasks, 
             raise HTTPException(status_code=400, detail="Wallet not found for this user.")
             
         # Ensure we safely handle NULL database values
-        available_balance = wallet.get('balance_available') or 0.0
+        available_balance = float(wallet.get('balance_available') or 0.0)
         
         if available_balance < req.amount:
             raise HTTPException(status_code=400, detail=f"Insufficient funds. You only have KES {available_balance:,.2f} available.")
