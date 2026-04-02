@@ -1373,6 +1373,72 @@ def generate_cart_quotation(user: dict = Depends(get_current_user)):
     finally:
         conn.close()
 
+@app.get("/api/listings/{listing_id}/quotation")
+def generate_single_listing_quotation(listing_id: str, user: dict = Depends(get_current_user)):
+    """Generates a Proforma Invoice/Quotation for a specific item without adding to cart"""
+    conn = get_db_connection()
+    cursor = conn.cursor(cursor_factory=RealDictCursor)
+    try:
+        # Fetch listing details
+        cursor.execute("""
+            SELECT m.brand, m.model, m.price as unit_price, m.seller_name, m.currency, u.email as seller_email
+            FROM marketplace_listings m
+            LEFT JOIN users u ON m.phone = u.phone
+            WHERE m.id = %s
+        """, (listing_id,))
+        listing = cursor.fetchone()
+        
+        if not listing:
+            raise HTTPException(status_code=404, detail="Listing not found.")
+
+        # Fetch user details
+        cursor.execute("SELECT username, email, phone FROM users WHERE id = %s", (user['user_id'],))
+        user_info = cursor.fetchone()
+        user.update(user_info)
+
+        currency = listing['currency'] or "KES"
+        total = float(listing['unit_price'])
+        quote_id = f"QT-{uuid.uuid4().hex[:8].upper()}"
+        
+        items = [{
+            "brand": listing['brand'],
+            "model": listing['model'],
+            "unit_price": total,
+            "quantity": 1,
+            "seller_name": listing['seller_name'] or "DAGIV Verified Partner",
+            "currency": currency,
+            "seller_email": listing['seller_email'] or "Contact via Platform"
+        }]
+
+        buffer = BytesIO()
+        p = canvas.Canvas(buffer, pagesize=letter)
+        
+        draw_enterprise_pdf(
+            p=p, 
+            title="PROFORMA INVOICE", 
+            doc_id=quote_id, 
+            user=user, 
+            items=items, 
+            total_amount=total, 
+            currency=currency, 
+            status="QUOTATION", 
+            is_quotation=True
+        )
+        
+        buffer.seek(0)
+        return StreamingResponse(
+            buffer, 
+            media_type="application/pdf", 
+            headers={"Content-Disposition": f"attachment; filename=DAGIV_Quotation_{quote_id}.pdf"}
+        )
+
+    except Exception as e:
+        print(f"Single Quotation Gen Error: {e}")
+        raise HTTPException(status_code=500, detail="Failed to generate quotation")
+    finally:
+        cursor.close()
+        conn.close()
+
 @app.get("/api/buyer/orders")
 def get_buyer_orders(user: dict = Depends(get_current_user)):
     """Fetches all orders for the logged-in buyer to populate the dashboard pipeline"""
