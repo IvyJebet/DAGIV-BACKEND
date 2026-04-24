@@ -2161,12 +2161,12 @@ def release_escrow(order_id: str, user: dict = Depends(get_current_user)):
             cursor.execute("SELECT id FROM users WHERE phone = %s", (item['seller_phone'],))
             seller = cursor.fetchone()
             if seller:
-                # Deduct full amount from pending, but only add the Net Payout to Available!
+                # --- FIX: Subtract exact net_payout from pending, add to available ---
                 cursor.execute("""
                     UPDATE wallets 
                     SET balance_pending = balance_pending - %s, balance_available = balance_available + %s 
                     WHERE user_id = %s
-                """, (item_total, net_payout, seller['id']))
+                """, (net_payout, net_payout, seller['id']))
         conn.commit()
         return {"status": "success", "message": "Funds have been released to the seller (Commission deducted)."}
     except Exception as e:
@@ -2174,7 +2174,7 @@ def release_escrow(order_id: str, user: dict = Depends(get_current_user)):
         raise HTTPException(status_code=500, detail=str(e))
     finally: 
         conn.close()
-
+        
 @app.post("/api/payments/mpesa/callback")
 async def mpesa_callback(request: Request, background_tasks: BackgroundTasks):
     conn = None
@@ -2193,14 +2193,27 @@ async def mpesa_callback(request: Request, background_tasks: BackgroundTasks):
                 order_id = txn['order_id']
                 cursor.execute("UPDATE orders SET status = 'FUNDS_SECURED' WHERE id = %s", (order_id,))
                 cursor.execute("UPDATE transactions SET status = 'COMPLETED' WHERE checkout_request_id = %s", (checkout_request_id,))
-                cursor.execute("SELECT seller_phone, unit_price, quantity FROM order_line_items WHERE order_id = %s", (order_id,))
+                
+                cursor.execute("""
+                    SELECT li.seller_phone, li.unit_price, li.quantity, m.listing_type 
+                    FROM order_line_items li 
+                    JOIN marketplace_listings m ON li.listing_id = m.id 
+                    WHERE li.order_id = %s
+                """, (order_id,))
                 items = cursor.fetchall()
+                
                 for item in items:
                     item_total = float(item['unit_price']) * item['quantity']
+                    
+                    # --- FIX: Calculate exact Net Payout for Pending Balance immediately ---
+                    base_item_total = item_total / (1 + VAT_RATE)
+                    commission_rate = COMMISSION_RATES.get(item['listing_type'], 0.05)
+                    net_payout = base_item_total - (base_item_total * commission_rate)
+                    
                     cursor.execute("SELECT id FROM users WHERE phone = %s", (item['seller_phone'],))
                     seller = cursor.fetchone()
                     if seller:
-                        cursor.execute("UPDATE wallets SET balance_pending = balance_pending + %s WHERE user_id = %s", (item_total, seller['id']))
+                        cursor.execute("UPDATE wallets SET balance_pending = balance_pending + %s WHERE user_id = %s", (net_payout, seller['id']))
                 conn.commit()
                 background_tasks.add_task(send_email_alert, "Escrow Secured (M-Pesa)", f"Order {order_id} has been fully funded.")
         return {"ResultCode": 0, "ResultDesc": "Accepted"}
@@ -2422,14 +2435,24 @@ def simulate_order_flow(order_id: str, background_tasks: BackgroundTasks):
             
             # --- MOCK FUND SECURING (Simulating M-Pesa Callback Math) ---
             if next_status == 'FUNDS_SECURED':
-                cursor.execute("SELECT seller_phone, unit_price, quantity FROM order_line_items WHERE order_id = %s", (order_id,))
+                cursor.execute("""
+                    SELECT li.seller_phone, li.unit_price, li.quantity, m.listing_type 
+                    FROM order_line_items li 
+                    JOIN marketplace_listings m ON li.listing_id = m.id 
+                    WHERE li.order_id = %s
+                """, (order_id,))
                 items = cursor.fetchall()
                 for item in items:
                     item_total = float(item['unit_price']) * item['quantity']
+                    
+                    base_item_total = item_total / (1 + VAT_RATE)
+                    commission_rate = COMMISSION_RATES.get(item['listing_type'], 0.05)
+                    net_payout = base_item_total - (base_item_total * commission_rate)
+                    
                     cursor.execute("SELECT id FROM users WHERE phone = %s", (item['seller_phone'],))
                     seller = cursor.fetchone()
                     if seller:
-                        cursor.execute("UPDATE wallets SET balance_pending = balance_pending + %s WHERE user_id = %s", (item_total, seller['id']))
+                        cursor.execute("UPDATE wallets SET balance_pending = balance_pending + %s WHERE user_id = %s", (net_payout, seller['id']))
 
             # --- MOCK ESCROW RELEASE ---
             if next_status == 'RELEASED':
@@ -2444,11 +2467,9 @@ def simulate_order_flow(order_id: str, background_tasks: BackgroundTasks):
                 for item in items:
                     item_total = float(item['unit_price']) * item['quantity']
                     
-                    # Recalculate true base to deduct commission (unit_price includes VAT)
                     base_item_total = item_total / (1 + VAT_RATE)
                     commission_rate = COMMISSION_RATES.get(item['listing_type'], 0.05)
-                    dagiv_cut = base_item_total * commission_rate
-                    net_payout = base_item_total - dagiv_cut # Money going to seller
+                    net_payout = base_item_total - (base_item_total * commission_rate)
                     
                     cursor.execute("SELECT id FROM users WHERE phone = %s", (item['seller_phone'],))
                     seller = cursor.fetchone()
@@ -2457,7 +2478,7 @@ def simulate_order_flow(order_id: str, background_tasks: BackgroundTasks):
                             UPDATE wallets 
                             SET balance_pending = balance_pending - %s, balance_available = balance_available + %s 
                             WHERE user_id = %s
-                        """, (item_total, net_payout, seller['id']))
+                        """, (net_payout, net_payout, seller['id']))
 
             # Update the order status string
             cursor.execute("UPDATE orders SET status = %s WHERE id = %s", (next_status, order_id))
