@@ -392,7 +392,7 @@ def send_email_async(self, to_email: str, subject: str, body: str):
     s_email = os.getenv("SENDER_EMAIL") or SENDER_EMAIL
     s_pass = os.getenv("SENDER_PASSWORD") or SENDER_PASSWORD
     
-    logger.info(f"📧 Attempting to send email to {to_email} via {s_}...")
+    logger.info(f"📧 Attempting to send email to {to_email} via {s_email}...")
 
     if not s_pass or "REPLACE_THIS" in s_pass:
         logger.error("❌ SENDER_PASSWORD is not set or is still the default!")
