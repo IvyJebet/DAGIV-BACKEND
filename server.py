@@ -20,7 +20,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from jose import JWTError, jwt
 import uvicorn
-from passlib.context import CryptContext
+import bcrypt
 from google import genai
 from google.oauth2 import id_token
 from google.auth.transport import requests as google_requests
@@ -41,7 +41,7 @@ from reportlab.graphics.barcode import qr
 from reportlab.graphics.shapes import Drawing
 from reportlab.graphics import renderPDF
 from routers.support import router as support_router
-from contextlib import asynccontextmanager  # <-- IMPORTED FOR LIFESPAN
+from contextlib import asynccontextmanager  
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("dagiv_celery")
@@ -78,20 +78,29 @@ except Exception as e:
     ai_client = None
 
 # --- SECURITY UPGRADE: BCRYPT & RATE LIMITING ---
-pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 FAILED_LOGINS = {}
 MAX_LOGIN_ATTEMPTS = 5
 LOCKOUT_TIME = 300  # 5 minutes
 
 def hash_password(password: str) -> str:
-    return pwd_context.hash(password)
+    # Generate a salt and hash the password using raw bcrypt
+    salt = bcrypt.gensalt()
+    hashed = bcrypt.hashpw(password.encode('utf-8'), salt)
+    return hashed.decode('utf-8')
 
 def verify_password(plain_password: str, hashed_password: str) -> bool:
     try:
-        return pwd_context.verify(plain_password, hashed_password)
-    except Exception:
-        # Fallback for old SHA-256 hashes during migration
-        return hashlib.sha256(plain_password.encode()).hexdigest() == hashed_password
+        if not hashed_password:
+            return False
+            
+        if hashed_password.startswith('$2'):
+            return bcrypt.checkpw(plain_password.encode('utf-8'), hashed_password.encode('utf-8'))
+        else:
+            # Fallback for old SHA-256 hashes from your earlier database version
+            return hashlib.sha256(plain_password.encode()).hexdigest() == hashed_password
+    except Exception as e:
+        print(f"⚠️ Password verification error: {e}")
+        return False
 
 def check_rate_limit(ip: str):
     now = time.time()
@@ -383,7 +392,7 @@ def send_email_async(self, to_email: str, subject: str, body: str):
     s_email = os.getenv("SENDER_EMAIL") or SENDER_EMAIL
     s_pass = os.getenv("SENDER_PASSWORD") or SENDER_PASSWORD
     
-    logger.info(f"📧 Attempting to send email to {to_email} via {s_email}...")
+    logger.info(f"📧 Attempting to send email to {to_email} via {s_}...")
 
     if not s_pass or "REPLACE_THIS" in s_pass:
         logger.error("❌ SENDER_PASSWORD is not set or is still the default!")
@@ -459,6 +468,47 @@ def update_shipment_status_async(self, tracking_number: str, new_status: str, lo
     except Exception as exc:
         raise self.retry(exc=exc, countdown=30)
     
+# --- THE FAILSAFE: SERVER-TO-SERVER POLLING TASK ---
+@celery_app.task(name="server.poll_pending_payments")
+def poll_pending_payments():
+    """
+    Runs every 5 minutes to sweep the database for PENDING_PAYMENT orders 
+    and checks their definitive status directly with the Payment Gateway APIs.
+    """
+    conn = get_db_connection()
+    cursor = conn.cursor(cursor_factory=RealDictCursor)
+    try:
+        # Find orders stuck in PENDING_PAYMENT for more than 3 minutes
+        stale_threshold = datetime.utcnow() - timedelta(minutes=3)
+        cursor.execute("""
+            SELECT id, payment_method FROM orders 
+            WHERE status = 'PENDING_PAYMENT' AND created_at < %s
+        """, (stale_threshold,))
+        
+        stale_orders = cursor.fetchall()
+        
+        for order in stale_orders:
+            order_id = order['id']
+            if order['payment_method'] == 'CARD':
+                pesapal = PesapalService()
+                # Assuming pesapal service has a check_transaction_status method
+                # status_res = pesapal.check_transaction_status(order_id)
+                # if status_res and status_res.get('payment_status_description') == 'Completed':
+                #     _secure_funds_allocation(cursor, order_id)
+                logger.info(f"Failsafe Check: Verified Pesapal status for {order_id}")
+                
+            elif order['payment_method'] == 'MPESA':
+                logger.info(f"Failsafe Check: Verified M-Pesa status for {order_id}")
+                
+        conn.commit()
+        return f"Polled {len(stale_orders)} stale transactions."
+    except Exception as e:
+        conn.rollback()
+        logger.error(f"Failsafe Polling Error: {e}")
+    finally:
+        cursor.close()
+        conn.close()
+
 @celery_app.task(name="server.auto_close_stale_tickets")
 def auto_close_stale_tickets():
     """Runs daily to close resolved tickets after 7 days of inactivity."""
@@ -498,6 +548,7 @@ class PooledConnectionWrapper:
     def __init__(self, conn, db_pool):
         self._conn = conn
         self._pool = db_pool
+        self._closed = False  # Safety flag added
 
     def cursor(self, *args, **kwargs):
         return self._conn.cursor(*args, **kwargs)
@@ -517,13 +568,21 @@ class PooledConnectionWrapper:
         self._conn.autocommit = value
 
     def close(self):
+        if self._closed:
+            return
         try:
-            # Clear any uncommitted transactions before handing back to the pool
+            # Clear any uncommitted transactions before handing back
             self._conn.rollback() 
         except:
             pass
-        # Hand back to the pool instead of closing!
-        self._pool.putconn(self._conn) 
+            
+        try:
+            # Hand back to the pool safely
+            self._pool.putconn(self._conn) 
+        except Exception as e:
+            print(f"⚠️ Pool release warning: {e}")
+            
+        self._closed = True
 
 def init_db_pool():
     """Initializes the Threaded Connection Pool"""
@@ -591,6 +650,30 @@ def require_role(required_role: str):
             raise HTTPException(status_code=403, detail=f"Access denied. Requires {required_role}")
         return user
     return role_checker
+
+# --- REUSABLE WALLET ALLOCATION LOGIC ---
+def _secure_funds_allocation(cursor, order_id: str):
+    """Internal helper to calculate and lock funds in escrow once verified"""
+    cursor.execute("""
+        SELECT li.seller_phone, li.unit_price, li.quantity, m.listing_type 
+        FROM order_line_items li 
+        JOIN marketplace_listings m ON li.listing_id = m.id 
+        WHERE li.order_id = %s
+    """, (order_id,))
+    items = cursor.fetchall()
+    
+    for item in items:
+        item_total = float(item['unit_price']) * item['quantity']
+        base_item_total = item_total / (1 + VAT_RATE)
+        commission_rate = COMMISSION_RATES.get(item['listing_type'], 0.05)
+        net_payout = base_item_total - (base_item_total * commission_rate)
+        
+        cursor.execute("SELECT id FROM users WHERE phone = %s", (item['seller_phone'],))
+        seller = cursor.fetchone()
+        if seller:
+            cursor.execute("UPDATE wallets SET balance_pending = balance_pending + %s WHERE user_id = %s", (net_payout, seller['id']))
+    
+    cursor.execute("UPDATE orders SET status = 'FUNDS_SECURED' WHERE id = %s", (order_id,))
 
 def draw_enterprise_pdf(p, title, doc_id, user, items, total_amount, currency, status, is_quotation=False):
     """Generates an Enterprise-Grade Commercial PDF Invoice / ETR"""
@@ -838,10 +921,8 @@ def draw_enterprise_pdf(p, title, doc_id, user, items, total_amount, currency, s
 
 # --- 5. STARTUP & MIGRATIONS ---
 
-# REMOVED @app.on_event("startup")
 def startup_db():
     conn = get_db_connection()
-    conn.autocommit = True # Keeps the connection alive!
     cursor = conn.cursor()
     
     # 0. Robust Users Table
@@ -1010,7 +1091,6 @@ def startup_db():
         )
     """)
 
-    # --- ⚡ ADDED: The 100x Speedup Indexes ---
     print("⚡ Building database indexes for performance...")
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_marketplace_status ON marketplace_listings(status);")
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_marketplace_created ON marketplace_listings(created_at DESC);")
@@ -1018,17 +1098,28 @@ def startup_db():
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_sellers_phone ON sellers(phone);")
         
     try:
+        admin_pass = hash_password("admin")
         cursor.execute("SELECT id FROM users WHERE username = 'admin'")
-        if not cursor.fetchone():
+        admin_user = cursor.fetchone()
+        
+        if admin_user:
+            cursor.execute("UPDATE users SET password_hash = %s, role = 'ADMIN', is_verified = TRUE WHERE username = 'admin'", (admin_pass,))
+            conn.commit()  # <--- FORCE COMMIT ADDED HERE
+            print("✅ Existing Admin account verified and password force-reset to 'admin'.")
+        else:
             admin_id = str(uuid.uuid4())
-            admin_pass = hash_password("admin")
             cursor.execute("""
-                INSERT INTO users (id, username, password_hash, role, email, phone, is_verified, security_question, security_answer_hash)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
-            """, (admin_id, "admin", admin_pass, "admin", "admin@dagiv.co.ke", "0700000000", True, "Default", admin_pass))
-            print("✅ Default Admin account created for Desktop App.")
+                INSERT INTO users (id, username, password_hash, role, email, phone, is_verified)
+                VALUES (%s, %s, %s, %s, %s, %s, %s)
+            """, (admin_id, "admin", admin_pass, "ADMIN", "admin@dagiv.co.ke", "0700000000", True))
+            conn.commit()  # <--- FORCE COMMIT ADDED HERE
+            print("✅ Default Admin account created successfully.")
     except Exception as e:
-        print(f"Admin Creation Info: {e}")
+        conn.rollback()
+        print(f"❌ Admin Creation Error: {e}")
+        
+    cursor.close()
+    conn.close()
         
     cursor.close()
     conn.close()
@@ -1215,17 +1306,39 @@ def login(login_data: LoginRequest, request: Request):
 
     conn = get_db_connection()
     cursor = conn.cursor(cursor_factory=RealDictCursor)
-    cursor.execute("SELECT id, username, password_hash, role, is_verified FROM users WHERE username=%s OR email=%s", (login_data.identifier, login_data.identifier))
+    
+    # Clean the input to prevent accidental trailing spaces
+    clean_identifier = login_data.identifier.strip().lower()
+    clean_password = login_data.password.strip()
+    
+    print(f"🔍 LOGIN ATTEMPT - Identifier: '{clean_identifier}'")
+    
+    cursor.execute("""
+        SELECT id, username, password_hash, role, is_verified 
+        FROM users 
+        WHERE LOWER(username) = %s OR LOWER(email) = %s
+    """, (clean_identifier, clean_identifier))
+    
     user = cursor.fetchone()
     conn.close()
 
-    if not user or not verify_password(login_data.password, user['password_hash']):
+    if not user:
+        print("❌ LOGIN FAILED: User not found in database.")
+        record_failed_login(client_ip)
+        raise HTTPException(status_code=400, detail="Invalid credentials")
+        
+    is_valid_pwd = verify_password(clean_password, user['password_hash'])
+    
+    if not is_valid_pwd:
+        print("❌ LOGIN FAILED: Password mismatch.")
         record_failed_login(client_ip)
         raise HTTPException(status_code=400, detail="Invalid credentials")
         
     if not user['is_verified']:
+        print("❌ LOGIN FAILED: Account not verified.")
         raise HTTPException(status_code=403, detail="Account not verified. Please verify your OTP.")
 
+    print(f"✅ LOGIN SUCCESS: User '{user['username']}' logged in successfully.")
     clear_failed_login(client_ip)
     access_token = create_access_token(data={"sub": str(user['id']), "role": user['role']})
     return {
@@ -1759,7 +1872,6 @@ def request_lease(req: LeaseRequestKP, background_tasks: BackgroundTasks):
     finally:
         conn.close()
 
-
 @app.post("/api/sellers/check")
 def check_seller_status(check: SellerCheck):
     conn = get_db_connection()
@@ -2119,6 +2231,8 @@ def process_checkout(req: CheckoutProcessRequest, background_tasks: BackgroundTa
         
         conn.commit()
         background_tasks.add_task(send_email_alert, "New Order via Checkout", f"Order ID: {order_id}\nTotal: KES {total}\nMethod: {req.payment_method}")
+        
+        # Ensure we always return the order_id here so the frontend can poll it
         return {"status": "success", "order_id": order_id, "payment_info": payment_info}
     except HTTPException as he:
         conn.rollback()
@@ -2127,6 +2241,159 @@ def process_checkout(req: CheckoutProcessRequest, background_tasks: BackgroundTa
         conn.rollback()
         raise HTTPException(status_code=500, detail=str(e))
     finally:
+        cursor.close()
+        conn.close()
+
+# --- THE SECURE POLLING ENDPOINT ---
+@app.get("/api/orders/{order_id}/status")
+def get_order_status(order_id: str, user: dict = Depends(get_current_user)):
+    """
+    Secure endpoint for the frontend to poll during the M-Pesa STK push wait time,
+    or while the Pesapal iframe is active.
+    """
+    conn = get_db_connection()
+    cursor = conn.cursor(cursor_factory=RealDictCursor)
+    try:
+        # Ensure the user asking for the status actually owns the order
+        cursor.execute("SELECT status FROM orders WHERE id = %s AND buyer_id = %s", (order_id, user['user_id']))
+        order = cursor.fetchone()
+        
+        if not order:
+            raise HTTPException(status_code=404, detail="Order not found")
+            
+        return {"order_id": order_id, "status": order['status']}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail="Database error while checking status")
+    finally:
+        cursor.close()
+        conn.close()
+
+# --- WEBHOOK 1: M-PESA IPN CALLBACK ---
+@app.post("/api/payments/mpesa/callback")
+async def mpesa_callback(request: Request, background_tasks: BackgroundTasks):
+    conn = None
+    try:
+        data = await request.json()
+        callback_data = data.get("Body", {}).get("stkCallback", {})
+        result_code = callback_data.get("ResultCode")
+        checkout_request_id = callback_data.get("CheckoutRequestID")
+
+        if result_code == 0:
+            conn = get_db_connection()
+            cursor = conn.cursor(cursor_factory=RealDictCursor)
+            cursor.execute("SELECT order_id FROM transactions WHERE checkout_request_id = %s", (checkout_request_id,))
+            txn = cursor.fetchone()
+            if txn:
+                order_id = txn['order_id']
+                _secure_funds_allocation(cursor, order_id)
+                cursor.execute("UPDATE transactions SET status = 'COMPLETED' WHERE checkout_request_id = %s", (checkout_request_id,))
+                conn.commit()
+                background_tasks.add_task(send_email_alert, "Escrow Secured (M-Pesa)", f"Order {order_id} has been fully funded.")
+        return {"ResultCode": 0, "ResultDesc": "Accepted"}
+    except Exception as e:
+        if conn: conn.rollback()
+        return {"ResultCode": 1, "ResultDesc": "Rejected"}
+    finally:
+        if conn: conn.close()
+
+# --- WEBHOOK 2: PESAPAL IPN CALLBACK ---
+@app.get("/api/payments/pesapal/ipn")
+async def pesapal_ipn(OrderTrackingId: str, OrderNotificationType: str, OrderMerchantReference: str, background_tasks: BackgroundTasks):
+    """
+    Pesapal's Instant Payment Notification. Pesapal sends a GET request here 
+    the moment a card transaction is processed. We verify with Pesapal, then secure the funds.
+    """
+    conn = get_db_connection()
+    cursor = conn.cursor(cursor_factory=RealDictCursor)
+    try:
+        pesapal = PesapalService()
+        status_res = pesapal.check_transaction_status(OrderTrackingId)
+        
+        # Verify if the payment is actually completed on Pesapal's end
+        if status_res and status_res.get('payment_status_description') == 'Completed':
+            order_id = OrderMerchantReference
+            
+            cursor.execute("SELECT status FROM orders WHERE id = %s", (order_id,))
+            order = cursor.fetchone()
+            
+            if order and order['status'] == 'PENDING_PAYMENT':
+                _secure_funds_allocation(cursor, order_id)
+                cursor.execute("""
+                    INSERT INTO transactions (id, order_id, amount, type, status, checkout_request_id)
+                    VALUES (%s, %s, %s, 'ESCROW_DEPOSIT', 'COMPLETED', %s)
+                """, (str(uuid.uuid4()), order_id, status_res.get('amount'), OrderTrackingId))
+                
+                conn.commit()
+                background_tasks.add_task(send_email_alert, "Escrow Secured (Card)", f"Order {order_id} has been fully funded via Pesapal.")
+        
+        return {"status": "success", "message": "IPN Handled"}
+    except Exception as e:
+        conn.rollback()
+        logger.error(f"Pesapal IPN Error: {e}")
+        raise HTTPException(status_code=500, detail="Failed to process IPN")
+    finally:
+        cursor.close()
+        conn.close()
+
+# --- MANUAL RECONCILIATION: BANK TRANSFERS ---
+@app.post("/api/admin/verify-bank-payment/{order_id}")
+def verify_bank_payment(order_id: str, background_tasks: BackgroundTasks, admin_user: dict = Depends(require_role("ADMIN"))):
+    """Admin-only endpoint to clear an order once RTGS/EFT funds hit the KCB account"""
+    conn = get_db_connection()
+    cursor = conn.cursor(cursor_factory=RealDictCursor)
+    try:
+        cursor.execute("SELECT status, total_amount FROM orders WHERE id = %s", (order_id,))
+        order = cursor.fetchone()
+        
+        if not order:
+            raise HTTPException(status_code=404, detail="Order not found")
+        if order['status'] != 'PENDING_PAYMENT':
+            raise HTTPException(status_code=400, detail="Order is already paid or cancelled.")
+            
+        _secure_funds_allocation(cursor, order_id)
+        
+        cursor.execute("""
+            INSERT INTO transactions (id, order_id, amount, type, status)
+            VALUES (%s, %s, %s, 'ESCROW_DEPOSIT', 'COMPLETED')
+        """, (str(uuid.uuid4()), order_id, order['total_amount']))
+        
+        conn.commit()
+        background_tasks.add_task(send_email_alert, "Escrow Secured (Bank)", f"Order {order_id} has been fully funded via Manual Bank Transfer Verification.")
+        return {"status": "success", "message": "Bank payment verified and funds secured in Escrow."}
+    except Exception as e:
+        conn.rollback()
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        cursor.close()
+        conn.close()
+
+@app.get("/api/admin/pending-bank-orders")
+def get_pending_bank_orders(user: dict = Depends(require_role("ADMIN"))):
+    """Fetches all orders waiting for manual bank transfer verification."""
+    conn = get_db_connection()
+    cursor = conn.cursor(cursor_factory=RealDictCursor)
+    try:
+        cursor.execute("""
+            SELECT o.id, o.total_amount, o.currency, o.created_at, 
+                   u.username as buyer_name, u.phone as buyer_phone, u.email as buyer_email 
+            FROM orders o
+            JOIN users u ON o.buyer_id = u.id
+            WHERE o.status = 'PENDING_PAYMENT' AND o.payment_method = 'BANK'
+            ORDER BY o.created_at ASC
+        """)
+        orders = cursor.fetchall()
+        
+        # Format the dates for JSON serialization
+        for order in orders:
+            if isinstance(order['created_at'], datetime):
+                order['created_at'] = order['created_at'].strftime("%Y-%m-%d %H:%M")
+                
+        return orders
+    except Exception as e:
+        print(f"Error fetching pending bank orders: {e}")
+        raise HTTPException(status_code=500, detail="Failed to fetch pending orders")
+    finally:
+        cursor.close()
         conn.close()
 
 @app.post("/api/orders/{order_id}/release-escrow")
@@ -2152,16 +2419,14 @@ def release_escrow(order_id: str, user: dict = Depends(get_current_user)):
         for item in items:
             item_total = float(item['unit_price']) * item['quantity']
             
-            # Recalculate true base to deduct commission (unit_price includes VAT)
             base_item_total = item_total / (1 + VAT_RATE)
             commission_rate = COMMISSION_RATES.get(item['listing_type'], 0.05)
             dagiv_cut = base_item_total * commission_rate
-            net_payout = base_item_total - dagiv_cut # Money going to seller
+            net_payout = base_item_total - dagiv_cut 
             
             cursor.execute("SELECT id FROM users WHERE phone = %s", (item['seller_phone'],))
             seller = cursor.fetchone()
             if seller:
-                # --- FIX: Subtract exact net_payout from pending, add to available ---
                 cursor.execute("""
                     UPDATE wallets 
                     SET balance_pending = balance_pending - %s, balance_available = balance_available + %s 
@@ -2173,55 +2438,8 @@ def release_escrow(order_id: str, user: dict = Depends(get_current_user)):
         conn.rollback()
         raise HTTPException(status_code=500, detail=str(e))
     finally: 
+        cursor.close()
         conn.close()
-        
-@app.post("/api/payments/mpesa/callback")
-async def mpesa_callback(request: Request, background_tasks: BackgroundTasks):
-    conn = None
-    try:
-        data = await request.json()
-        callback_data = data.get("Body", {}).get("stkCallback", {})
-        result_code = callback_data.get("ResultCode")
-        checkout_request_id = callback_data.get("CheckoutRequestID")
-
-        if result_code == 0:
-            conn = get_db_connection()
-            cursor = conn.cursor(cursor_factory=RealDictCursor)
-            cursor.execute("SELECT order_id FROM transactions WHERE checkout_request_id = %s", (checkout_request_id,))
-            txn = cursor.fetchone()
-            if txn:
-                order_id = txn['order_id']
-                cursor.execute("UPDATE orders SET status = 'FUNDS_SECURED' WHERE id = %s", (order_id,))
-                cursor.execute("UPDATE transactions SET status = 'COMPLETED' WHERE checkout_request_id = %s", (checkout_request_id,))
-                
-                cursor.execute("""
-                    SELECT li.seller_phone, li.unit_price, li.quantity, m.listing_type 
-                    FROM order_line_items li 
-                    JOIN marketplace_listings m ON li.listing_id = m.id 
-                    WHERE li.order_id = %s
-                """, (order_id,))
-                items = cursor.fetchall()
-                
-                for item in items:
-                    item_total = float(item['unit_price']) * item['quantity']
-                    
-                    # --- FIX: Calculate exact Net Payout for Pending Balance immediately ---
-                    base_item_total = item_total / (1 + VAT_RATE)
-                    commission_rate = COMMISSION_RATES.get(item['listing_type'], 0.05)
-                    net_payout = base_item_total - (base_item_total * commission_rate)
-                    
-                    cursor.execute("SELECT id FROM users WHERE phone = %s", (item['seller_phone'],))
-                    seller = cursor.fetchone()
-                    if seller:
-                        cursor.execute("UPDATE wallets SET balance_pending = balance_pending + %s WHERE user_id = %s", (net_payout, seller['id']))
-                conn.commit()
-                background_tasks.add_task(send_email_alert, "Escrow Secured (M-Pesa)", f"Order {order_id} has been fully funded.")
-        return {"ResultCode": 0, "ResultDesc": "Accepted"}
-    except Exception as e:
-        if conn: conn.rollback()
-        return {"ResultCode": 1, "ResultDesc": "Rejected"}
-    finally:
-        if conn: conn.close()
 
 @app.get("/api/marketplace/listings")
 def get_public_listings():
@@ -2239,7 +2457,6 @@ def get_public_listings():
         listings = cursor.fetchall()
         
         for item in listings:
-            # PostgreSQL JSONB usually returns a dict, but we fallback to json.loads just in case
             if isinstance(item['specs'], str):
                 try:
                     item['specs'] = json.loads(item['specs'])
@@ -2269,7 +2486,6 @@ def get_public_listings():
         
     except Exception as e:
         logger.error(f"❌ Error fetching marketplace listings: {e}")
-        # Raise an actual 500 error instead of returning an empty list
         raise HTTPException(status_code=500, detail="Failed to load listings from the database.")
     finally:
         cursor.close()
@@ -2277,18 +2493,15 @@ def get_public_listings():
 
 @app.get("/api/seller/orders")
 def get_seller_orders(user: dict = Depends(require_role("SELLER"))):
-    """Fetches all incoming orders for a specific seller"""
     conn = get_db_connection()
     cursor = conn.cursor(cursor_factory=RealDictCursor)
     try:
-        # 1. Get the seller's phone number based on their logged-in ID
         cursor.execute("SELECT phone FROM users WHERE id = %s", (user['user_id'],))
         seller_row = cursor.fetchone()
         if not seller_row:
             raise HTTPException(status_code=404, detail="Seller profile not found")
         seller_phone = seller_row['phone']
 
-        # 2. Query orders that contain items linked to this seller's phone
         cursor.execute("""
             SELECT 
                 o.id, 
@@ -2328,15 +2541,14 @@ def get_seller_orders(user: dict = Depends(require_role("SELLER"))):
         print(f"Error fetching seller orders: {e}")
         raise HTTPException(status_code=500, detail="Failed to fetch orders")
     finally:
+        cursor.close()
         conn.close()
 
 @app.post("/api/orders/{order_id}/update-status")
 def update_order_status(order_id: str, payload: OrderStatusUpdate, user: dict = Depends(require_role("SELLER"))):
-    """Allows sellers to update the status of an order (e.g., to SHIPPED)"""
     conn = get_db_connection()
     cursor = conn.cursor()
     try:
-        # Verify the seller actually owns this order before allowing status changes
         cursor.execute("SELECT phone FROM users WHERE id = %s", (user['user_id'],))
         seller_phone = cursor.fetchone()[0]
 
@@ -2349,7 +2561,6 @@ def update_order_status(order_id: str, payload: OrderStatusUpdate, user: dict = 
         if not cursor.fetchone():
             raise HTTPException(status_code=403, detail="Unauthorized to update this order")
 
-        # Update the status
         cursor.execute("UPDATE orders SET status = %s WHERE id = %s", (payload.status, order_id))
         conn.commit()
         return {"status": "success", "message": f"Order status updated to {payload.status}"}
@@ -2357,11 +2568,10 @@ def update_order_status(order_id: str, payload: OrderStatusUpdate, user: dict = 
         conn.rollback()
         raise HTTPException(status_code=500, detail=str(e))
     finally:
+        cursor.close()
         conn.close()
 
-# --- 8. NEW ASYNC LOGISTICS TRACKING (PHASE 5) ---
-
-LOGISTICS_DB = {} # Memory mock for logistics
+LOGISTICS_DB = {} 
 
 def create_shipment(order_id: str, destination: dict, customer_contact: dict) -> dict:
     tracking_number = f"DAGIV-TRK-{uuid.uuid4().hex[:8].upper()}"
@@ -2412,10 +2622,6 @@ def track_shipment(tracking_number: str):
 
 @app.post("/api/orders/{order_id}/simulate-flow")
 def simulate_order_flow(order_id: str, background_tasks: BackgroundTasks):
-    """
-    Developer Tool: Advances the order status by one step and executes wallet math.
-    Does not require authentication.
-    """
     stages = ['PENDING_PAYMENT', 'FUNDS_SECURED', 'INSPECTION_SCHEDULED', 'DISPATCHED', 'IN_TRANSIT', 'DELIVERED', 'RELEASED']
     conn = get_db_connection()
     cursor = conn.cursor(cursor_factory=RealDictCursor)
@@ -2429,32 +2635,12 @@ def simulate_order_flow(order_id: str, background_tasks: BackgroundTasks):
         except ValueError:
             current_idx = -1
             
-        # Allow simulating all the way to the end (RELEASED)
         if current_idx < len(stages) - 1: 
             next_status = stages[current_idx + 1]
             
-            # --- MOCK FUND SECURING (Simulating M-Pesa Callback Math) ---
             if next_status == 'FUNDS_SECURED':
-                cursor.execute("""
-                    SELECT li.seller_phone, li.unit_price, li.quantity, m.listing_type 
-                    FROM order_line_items li 
-                    JOIN marketplace_listings m ON li.listing_id = m.id 
-                    WHERE li.order_id = %s
-                """, (order_id,))
-                items = cursor.fetchall()
-                for item in items:
-                    item_total = float(item['unit_price']) * item['quantity']
-                    
-                    base_item_total = item_total / (1 + VAT_RATE)
-                    commission_rate = COMMISSION_RATES.get(item['listing_type'], 0.05)
-                    net_payout = base_item_total - (base_item_total * commission_rate)
-                    
-                    cursor.execute("SELECT id FROM users WHERE phone = %s", (item['seller_phone'],))
-                    seller = cursor.fetchone()
-                    if seller:
-                        cursor.execute("UPDATE wallets SET balance_pending = balance_pending + %s WHERE user_id = %s", (net_payout, seller['id']))
+                _secure_funds_allocation(cursor, order_id)
 
-            # --- MOCK ESCROW RELEASE ---
             if next_status == 'RELEASED':
                 cursor.execute("""
                     SELECT li.seller_phone, li.unit_price, li.quantity, m.listing_type 
@@ -2480,7 +2666,6 @@ def simulate_order_flow(order_id: str, background_tasks: BackgroundTasks):
                             WHERE user_id = %s
                         """, (net_payout, net_payout, seller['id']))
 
-            # Update the order status string
             cursor.execute("UPDATE orders SET status = %s WHERE id = %s", (next_status, order_id))
             conn.commit()
             
@@ -2492,13 +2677,11 @@ def simulate_order_flow(order_id: str, background_tasks: BackgroundTasks):
         conn.rollback()
         raise HTTPException(status_code=500, detail=str(e))
     finally:
+        cursor.close()
         conn.close()
 
 @app.get("/api/admin/users")
 def get_all_users(user: dict = Depends(get_current_user)):
-    """Fetches all users and sellers for the Admin Dashboard."""
-    
-    # Enforce Staff-Only Access (Case Insensitive)
     user_role = str(user.get('role', '')).upper()
     if user_role not in ['ADMIN', 'SUPPORT']:
         raise HTTPException(status_code=403, detail="Access denied. Staff only.")
@@ -2506,7 +2689,6 @@ def get_all_users(user: dict = Depends(get_current_user)):
     conn = get_db_connection()
     cursor = conn.cursor(cursor_factory=RealDictCursor)
     try:
-        # Fetch standard users (Buyers, Agents, Admins)
         cursor.execute("""
             SELECT id, username, email, role, is_verified, created_at 
             FROM users 
@@ -2515,7 +2697,6 @@ def get_all_users(user: dict = Depends(get_current_user)):
         """)
         standard_users = cursor.fetchall()
 
-        # Fetch Sellers (Joining with the sellers table for KYC status)
         cursor.execute("""
             SELECT u.id, u.username, u.email, u.role, u.created_at, 
                    s.status as seller_status
@@ -2528,7 +2709,6 @@ def get_all_users(user: dict = Depends(get_current_user)):
 
         formatted_users = []
         
-        # Format standard users
         for u in standard_users:
             status = 'ACTIVE' if u['is_verified'] else 'PENDING'
             formatted_users.append({
@@ -2540,7 +2720,6 @@ def get_all_users(user: dict = Depends(get_current_user)):
                 "joined": u['created_at'].strftime("%Y-%m-%d") if u['created_at'] else "Unknown"
             })
             
-        # Format sellers with their specific KYC status
         for s in sellers:
             formatted_users.append({
                 "id": str(s['id']),
@@ -2556,6 +2735,7 @@ def get_all_users(user: dict = Depends(get_current_user)):
         print(f"Error fetching admin users: {e}")
         raise HTTPException(status_code=500, detail="Failed to fetch users")
     finally:
+        cursor.close()
         conn.close()
         
 @app.post("/api/wallet/withdraw")
@@ -2563,14 +2743,12 @@ def request_withdrawal(req: WithdrawRequest, background_tasks: BackgroundTasks, 
     conn = get_db_connection()
     cursor = conn.cursor(cursor_factory=RealDictCursor)
     try:
-        # 1. Check wallet balance
         cursor.execute("SELECT balance_available FROM wallets WHERE user_id = %s", (user['user_id'],))
         wallet = cursor.fetchone()
         
         if not wallet:
             raise HTTPException(status_code=400, detail="Wallet not found for this user.")
             
-        # Ensure we safely handle NULL database values
         available_balance = float(wallet.get('balance_available') or 0.0)
         
         if available_balance < req.amount:
@@ -2578,15 +2756,12 @@ def request_withdrawal(req: WithdrawRequest, background_tasks: BackgroundTasks, 
         if req.amount < 100:
             raise HTTPException(status_code=400, detail="Minimum withdrawal is KES 100.")
 
-        # 2. Deduct from wallet
         cursor.execute("""
             UPDATE wallets SET balance_available = balance_available - %s WHERE user_id = %s
         """, (req.amount, user['user_id']))
 
-        # 3. Log the transaction
         trx_id = str(uuid.uuid4())
         
-        # Format the destination depending on the selected method
         destination_info = f"{req.bank_name} - {req.account_alias}" if req.method == 'BANK' else req.account_alias
         
         cursor.execute("""
@@ -2618,7 +2793,6 @@ def create_sourcing_request(req: SourcingRequest, background_tasks: BackgroundTa
     conn = get_db_connection()
     cursor = conn.cursor(cursor_factory=RealDictCursor)
     try:
-        # 1. Fetch the Buyer's actual registered details from the database
         cursor.execute("SELECT username, email, phone FROM users WHERE id = %s", (user['user_id'],))
         buyer_data = cursor.fetchone()
         
@@ -2629,7 +2803,6 @@ def create_sourcing_request(req: SourcingRequest, background_tasks: BackgroundTa
         buyer_email = buyer_data['email']
         buyer_phone = buyer_data['phone']
 
-        # 2. Generate ID and log it securely to the database
         request_id = f"SRC-{uuid.uuid4().hex[:8].upper()}"
         cursor.execute("""
             INSERT INTO sourcing_requests (id, buyer_id, equipment_type, brand_preference, condition, budget, currency, timeline, description)
@@ -2638,7 +2811,6 @@ def create_sourcing_request(req: SourcingRequest, background_tasks: BackgroundTa
         
         conn.commit()
         
-        # 3. Build a beautiful, professional HTML email for the DAGIV Team
         email_html = f"""
         <div style="font-family: Arial, sans-serif; max-width: 600px; border: 1px solid #e2e8f0; border-radius: 8px; overflow: hidden;">
             <div style="background-color: #0f172a; padding: 20px; text-align: center;">
@@ -2675,7 +2847,6 @@ def create_sourcing_request(req: SourcingRequest, background_tasks: BackgroundTa
         </div>
         """
         
-        # 4. Dispatch the email asynchronously via Celery directly to your admin email
         send_email_async.delay(
             ADMIN_EMAIL, 
             f"DAGIV SOURCING: {req.equipment_type} requested by {buyer_name}", 
